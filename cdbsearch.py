@@ -20,6 +20,15 @@ depthUnscored = 25  # score an unscored move if depth - scoredCount exceeds this
 depthReprobePV = 16  # do not call reprobe_PV when depth is smaller than this
 percentReprobePV = 1  # % of queryall API calls we are willing to use for reprobe_PV
 maxTimeOut = 60  # maximum timeout (+ sleep) value in seconds for (failed) API requests
+minQueueWait = 1  # initial wait in seconds for a queued position, doubled every poll
+
+# cdb limits the rate of requests per IP: we pace our API requests, and adapt the pace to what cdb accepts
+rateInitial = 8  # number of API requests per second we start with
+rateMin, rateMax = 0.5, 32  # bounds for the number of API requests per second
+rateIncrease = 0.5  # increase of the rate per second while cdb accepts our requests
+rateDecrease = 0.8  # factor applied to the rate if cdb rejects a request
+rateCoolOff = 0.5  # pause in seconds for all API requests after cdb rejected one
+rateRetries = 8  # paced retries of a rejected request, before we use the long sleeps
 
 
 class AtomicTT:
@@ -64,6 +73,9 @@ class AtomicInteger:
 
 
 class ChessDB:
+    # the current pace of API requests per second: shared by all instances, so that it survives from one search to the next
+    rate = rateInitial
+
     def __init__(
         self, concurrency, evalDecay, cursedWins, TBsearch, rootBoard, user, showErrors
     ):
@@ -106,6 +118,11 @@ class ChessDB:
         self.semaphoreAPI = asyncio.Semaphore(self.concurrency)
         self.semaphoreQueryall = asyncio.Semaphore(4 * self.concurrency)
 
+        # a lock and some time stamps to pace the API requests
+        self.lockPace = asyncio.Lock()
+        self.nextRequestTime = 0
+        self.lastRateDecrease = 0
+
         # a thread pool to do some of the blocking IO (TODO: look into aiohttp)
         self.executorWork = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.concurrency
@@ -130,15 +147,52 @@ class ChessDB:
         self.count_inflightRequests.dec()
         return content
 
+    async def __pace(self):
+        """wait for our turn to make an API request, returns True if we had to wait"""
+        waited = False
+        async with self.lockPace:
+            while True:
+                delay = self.nextRequestTime - time.perf_counter()
+                if delay <= 0:
+                    break
+                waited = True
+                await asyncio.sleep(delay)
+            self.nextRequestTime = time.perf_counter() + 1 / ChessDB.rate
+        return waited
+
     async def __cdbapicall(self, action, timeout=15):
         """co-routine to access the API"""
         async with self.semaphoreAPI:
-            return await asyncio.get_running_loop().run_in_executor(
-                self.executorWork,
-                self.__apicall,
-                "http://www.chessdb.cn/cdb.php" + action,
-                timeout,
-            )
+            retries = rateRetries
+            while True:
+                paced = await self.__pace()
+                content = await asyncio.get_running_loop().run_in_executor(
+                    self.executorWork,
+                    self.__apicall,
+                    "http://www.chessdb.cn/cdb.php" + action,
+                    timeout,
+                )
+                rejected = (
+                    isinstance(content, dict)
+                    and content.get("status") == "rate limit exceeded"
+                )
+                if not rejected:
+                    # cdb keeps up with our pace: if the pace was holding us back, increase it a bit
+                    if paced and content is not None:
+                        ChessDB.rate = min(
+                            ChessDB.rate + rateIncrease / ChessDB.rate, rateMax
+                        )
+                    return content
+                # cdb rejected the request: slow down (at most once per second), and give cdb a short break
+                now = time.perf_counter()
+                if now - self.lastRateDecrease > 1:
+                    ChessDB.rate = max(ChessDB.rate * rateDecrease, rateMin)
+                    self.lastRateDecrease = now
+                self.nextRequestTime = max(self.nextRequestTime, now + rateCoolOff)
+                # try again, unless cdb keeps rejecting: then the caller takes over with its long sleeps
+                if retries == 0:
+                    return content
+                retries -= 1
 
     async def add_cdb_pv_positions(self, epd, chess960):
         """query cdb for the PV of the position and create a dictionary containing these positions and their distance to the PV leaf for extensions during search"""
@@ -247,6 +301,7 @@ class ChessDB:
             self.count_sumInflightUncached.inc(self.count_inflightUncached.get())
 
             timeout = 5
+            queueWait = 0  # the time we wait for cdb to score a position we queued
             found = enqueued = False
             first = True
             result = {"depth": 0}
@@ -267,7 +322,10 @@ class ChessDB:
                             lasterror,
                             flush=True,
                         )
-                    await asyncio.sleep(timeout)
+                    # cdb often scores a queued position within seconds, so for those we poll quickly at first
+                    await asyncio.sleep(
+                        min(timeout, queueWait) if queueWait else timeout
+                    )
                 else:
                     first = False
 
@@ -306,6 +364,7 @@ class ChessDB:
                         continue
 
                     lasterror = "Enqueued position"
+                    queueWait = min(2 * queueWait, maxTimeOut) or minQueueWait
                     continue
 
                 elif content["status"] == "rate limit exceeded":
@@ -351,8 +410,9 @@ class ChessDB:
                     continue
 
             self.count_inflightUncached.dec()
-            # set and return a possibly even deeper result
-            return self.TT.set(epd, result)
+            # set and return a possibly even deeper result, unless fresh data from cdb was explicitly requested
+            deepest = self.TT.set(epd, result)
+            return result if skipTT else deepest
 
     async def reprobe_PV(self, board, pv):
         """query all positions along the PV, starting from its leaf and all the way back to the start position of rootBoard"""
