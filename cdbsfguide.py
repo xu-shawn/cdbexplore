@@ -564,8 +564,12 @@ async def main(args, root):
         rounds += 1
         if not args.exploreDepth or not targets:
             break
-        print(f"Exploring {min(len(targets), args.maxTargets)} targets.", flush=True)
-        for target in targets[: args.maxTargets]:
+        # The most important targets are chosen, and then explored deepest first: cdb updates the
+        # scores of a position when it is queried, so fixing a line from the bottom up lets the
+        # corrections of the deeper positions reach the ones above them.
+        chosen = sorted(targets[: args.maxTargets], key=lambda t: -t["ply"])
+        print(f"Exploring {len(chosen)} targets, deepest first.", flush=True)
+        for target in chosen:
             await guide.explore(target)
         print(flush=True)
         await guide.report(root)
@@ -706,7 +710,7 @@ if __name__ == "__main__":
     )
     argParser.add_argument(
         "--maxTargets",
-        help="Explore at most this many targets per round, the ones with the largest gap (with --pv: closest to the root) first.",
+        help="Explore at most this many targets per round: the ones with the largest gap (with --pv and --live: closest to the root). They are explored deepest first, so that cdb's evals get fixed from the bottom up.",
         type=int,
         default=8,
     )

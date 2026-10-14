@@ -185,10 +185,13 @@ It has three modes:
   This suits searches with billions of nodes.
 * With `--live`, one engine search keeps running from the root for as long as the program runs, and keeps deepening its TT.
   The walk along cdb's main line reads the engine's move at each position from that TT, while the search runs; where the TT has no deep entry, a search on an auxiliary thread, which shares only the TT with the background search, finds the engine's move (`--auxNodes`).
-  Every position where the engine's move differs from cdb's becomes a target, closest to the root first: cdb's own search settles the evals.
+  Every position where the engine's move differs from cdb's becomes a target: cdb's own search settles the evals.
   With `--scoreGap`, both moves are first scored by auxiliary searches, and only gaps of at least `--threshold` cp are explored.
   With `--rounds 0`, walking and exploring go on until stopped, and a target that is found again is explored one depth deeper.
   This needs the `ttprobe`, `ttmoves` and `aux*` commands of the [`cdb-tt`](https://github.com/xu-shawn/Stockfish/tree/cdb-tt) branch of Stockfish.
+
+In each round, the targets that are explored (`--maxTargets`) are explored deepest first, and every exploration ends by querying its line from the leaf back to the root.
+As cdb updates the scores of a position when it is queried, this fixes cdb's evals from the bottom up.
 
 ```
 usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--live] [--prefillNodes PREFILLNODES] [--minDepth MINDEPTH] [--auxNodes AUXNODES] [--scoreGap] [--threshold THRESHOLD] [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--concurrency CONCURRENCY]
@@ -224,7 +227,7 @@ options:
   --exploreDepth EXPLOREDEPTH
                         Explore every target with cdbsearch to this depth. With 0 we only walk and report. (default: 0)
   --maxTargets MAXTARGETS
-                        Explore at most this many targets per round, the ones with the largest gap (with --pv: closest to the root) first. (default: 8)
+                        Explore at most this many targets per round: the ones with the largest gap (with --pv and --live: closest to the root). They are explored deepest first, so that cdb's evals get fixed from the bottom up. (default: 8)
   --rounds ROUNDS       Number of rounds of exploring the targets, each followed by a new walk (with --pv: by comparing cdb with the earlier engine lines again). With 0, keep going until stopped. A target found again is explored one depth deeper. (default: 1)
   --concurrency CONCURRENCY
                         Argument passed to cdbsearch. (default: 16)
