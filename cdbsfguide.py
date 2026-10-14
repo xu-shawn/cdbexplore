@@ -6,12 +6,142 @@ from datetime import datetime, timedelta
 from multiprocessing import freeze_support
 
 
+def tt_score(kind, n):
+    """a score of the engine's TT reports, in cdb's convention for mates"""
+    if kind == "cp":
+        return n
+    return cdbsearch.CDB_MATE - n if n > 0 else -cdbsearch.CDB_MATE - n
+
+
+def parse_tt(line):
+    """the fields of a ttprobe or ttmove report as a dict, values and evals as ints (or None)"""
+    t = line.split()
+    d = {}
+    if t[0] == "ttmove":
+        d["ttmove"], t = t[1], t[2:]
+    else:
+        t = t[1:]
+    i = 0
+    while i < len(t):
+        if t[i] in ["value", "eval"]:
+            if t[i + 1] == "none":
+                d[t[i]], i = None, i + 2
+            else:
+                d[t[i]], i = tt_score(t[i + 1], int(t[i + 2])), i + 3
+        else:
+            d[t[i]], i = t[i + 1], i + 2
+    return d
+
+
+class LiveEngine:
+    """a UCI engine with a search running in the background, whose TT we probe meanwhile: this
+    needs the ttprobe and ttmoves commands of the cdb-tt branch of Stockfish"""
+
+    async def start(self, path, options):
+        self.info, self.auxInfo, self.name = "", "", path
+        self.replies = asyncio.Queue()
+        self.proc = await asyncio.create_subprocess_exec(
+            path,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            limit=2**20,
+        )
+        self.reader = asyncio.create_task(self.read())
+        await self.request("uci", lambda l: l == "uciok")
+        for name, value in options.items():
+            self.send(f"setoption name {name} value {value}")
+        await self.request("isready", lambda l: l == "readyok")
+
+    async def read(self):
+        while line := await self.proc.stdout.readline():
+            line = line.decode().strip()
+            if line.startswith("aux info"):
+                # remember the latest complete iteration of the auxiliary search
+                if " pv " in line and "bound" not in line:
+                    self.auxInfo = line
+            elif line.startswith("info"):
+                # remember the latest complete iteration of the background search
+                if (
+                    line.startswith("info depth")
+                    and " pv " in line
+                    and "bound" not in line
+                ):
+                    self.info = line
+            elif line.startswith("id name"):
+                self.name = line[8:]
+            elif not line.startswith(("id ", "option ")):
+                self.replies.put_nowait(line)
+
+    def send(self, cmd):
+        self.proc.stdin.write((cmd + "\n").encode())
+
+    async def request(self, cmd, last):
+        """send a command, and return the lines of its reply, up to the one for which last() holds"""
+        self.send(cmd)
+        lines = []
+        while True:
+            lines.append(await self.replies.get())
+            if last(lines[-1]):
+                return lines
+
+    def status(self):
+        """depth, nodes, score and the start of the PV of the background search"""
+        t = self.info.split()
+        if "nodes" not in t:
+            return "just started"
+        i = t.index("score")
+        pv = " ".join(t[t.index("pv") + 1 :][:6])
+        return f"depth {t[t.index('depth') + 1]}, {int(t[t.index('nodes') + 1]) / 1e9:.2f}B nodes, {t[i + 1]} {t[i + 2]}, pv {pv} ..."
+
+    def nodes(self):
+        t = self.info.split()
+        return int(t[t.index("nodes") + 1]) if "nodes" in t else 0
+
+    def position(self, board):
+        """set the engine's position to the one on board, with the moves leading to it"""
+        moves = " ".join(m.uci() for m in board.move_stack)
+        self.send(
+            f"position fen {board.root().fen()}" + bool(moves) * f" moves {moves}"
+        )
+
+    async def aux_search(self, board, nodes, move=None):
+        """a search of the auxiliary thread, which shares the TT with the background search:
+        returns its best move and score for the side to move, possibly restricted to a move
+        """
+        moves = " ".join(m.uci() for m in board.move_stack)
+        self.auxInfo = ""
+        self.send(
+            f"auxposition fen {board.root().fen()}" + bool(moves) * f" moves {moves}"
+        )
+        restrict = f" searchmoves {board.uci(move)}" if move else ""
+        best = (
+            await self.request(
+                f"auxgo nodes {nodes}{restrict}", lambda l: l.startswith("aux bestmove")
+            )
+        )[-1].split()[2]
+        t = self.auxInfo.split()
+        if "score" not in t:  # too few nodes for a single complete iteration
+            return board.parse_uci(best), None
+        i = t.index("score")
+        return board.parse_uci(best), tt_score(t[i + 1], int(t[i + 2]))
+
+    async def tt(self, board):
+        """the TT entry of the position on board, and those of the positions after its legal moves"""
+        self.position(board)
+        node = parse_tt(
+            (await self.request("ttprobe", lambda l: l.startswith("ttprobe")))[-1]
+        )
+        children = await self.request("ttmoves", lambda l: l == "ttmoves end")
+        return node, {c["ttmove"]: c for c in map(parse_tt, children[:-1])}
+
+
 class SFGuide:
     """use Stockfish to find where cdb's main lines are likely wrong, and let cdbsearch explore there"""
 
     def __init__(self, engine, args):
         self.engine = engine
         self.args = args
+        self.explored = {}  # the depth to which each target has been explored
 
     def chessdb(self, board):
         """a fresh ChessDB, so that we see cdb's current scores rather than cached ones"""
@@ -242,14 +372,111 @@ class SFGuide:
             disagreements += await self.compare_line(chessdb, root, start, pv)
         return self.pv_targets(root, disagreements)
 
+    async def live_walk(self, root):
+        """walk cdb's main line from root, comparing cdb's choices with the TT of the background search"""
+        chessdb = self.chessdb(root)
+        queue, seen, targets = [root.copy()], set(), []
+        # the largest amount by which the auxiliary searches preferred cdb's move to the engine's
+        noise = 0
+        print(f"Walk from {root.epd()}, {datetime.now().isoformat()}", flush=True)
+        print(f"  background search: {self.live.status()}", flush=True)
+
+        def bounded(c):
+            if not c or c.get("hit") != "1" or c.get("value") is None:
+                return "     -"
+            sign = {"exact": "=", "lower": ">=", "upper": "<="}.get(c["bound"], "?")
+            return f"{sign}{c['value']:+} d{c['depth']}"
+
+        while queue and len(seen) < self.args.maxNodes:
+            # breadth first: positions closer to the root matter more
+            board = queue.pop(0)
+            ply = len(board.move_stack) - len(root.move_stack)
+            if board.epd() in seen or board.is_game_over(claim_draw=True):
+                continue
+            if chess.popcount(board.occupied) <= cdbsearch.CDB_EGTB:
+                continue  # cdb knows these from its EGTB
+            seen.add(board.epd())
+            moves = await self.cdb_moves(chessdb, board)
+            if not moves:
+                continue
+            cdbBest = max(moves, key=lambda m: moves[m])
+            node, children = await self.live.tt(board)
+            side = "white" if board.turn == chess.WHITE else "black"
+            line = root.variation_san(board.move_stack[len(root.move_stack) :])
+            cdbSan = board.san(board.parse_uci(cdbBest))
+
+            # the engine's choice is its TT move, if that entry is deep enough to trust, or else the
+            # choice of a search on the auxiliary thread, which also deepens the shared TT there
+            sfMove, source = None, "TT"
+            if node.get("hit") == "1" and int(node["depth"]) >= self.args.minDepth:
+                try:
+                    sfMove = board.parse_uci(node["move"])
+                except ValueError:
+                    pass
+            if sfMove is None and self.args.auxNodes:
+                sfMove, _ = await self.live.aux_search(board, self.args.auxNodes)
+                source = "aux"
+
+            if sfMove is None:
+                verdict = f"no deep TT entry (depth {node.get('depth', '-')})"
+                target, follow = False, []
+            elif board.uci(sfMove) == cdbBest:
+                verdict = f"agree   {source} {bounded(children.get(cdbBest)) if source == 'TT' else ''}"
+                target, follow = False, [cdbBest]
+            else:
+                # Any disagreement is worth exploring: cdb's search settles the evals. Only with
+                # --scoreGap we first measure it, with equal budgets for both moves on the
+                # auxiliary thread, profiting from the shared TT.
+                sfBest = board.uci(sfMove)
+                s, c = children.get(sfBest, {}), children.get(cdbBest, {})
+                note = f"TT {bounded(s)} vs {bounded(c)}"
+                target = self.args.side in ["both", side]
+                if target and self.args.scoreGap:
+                    _, sScore = await self.live.aux_search(
+                        board, self.args.auxNodes, sfMove
+                    )
+                    _, cScore = await self.live.aux_search(
+                        board, self.args.auxNodes, board.parse_uci(cdbBest)
+                    )
+                    gap = sScore - cScore if None not in (sScore, cScore) else 0
+                    noise = max(noise, -gap)
+                    note += f", aux {sScore:+} vs {cScore:+}, gap {gap}"
+                    target = gap >= self.args.threshold
+                verdict = f"{source} {board.san(sfMove):>6} ({note})"
+                follow = [cdbBest] + ([sfBest] if target else [])
+            print(
+                f"  ply {ply:2} {side[0].upper()}  cdb {cdbSan:>6} {moves[cdbBest]:+5} | {verdict:<60}{' TARGET' if target else '':7} | {line or '(root)'}",
+                flush=True,
+            )
+            if target:
+                targets.append(self.target(board, sfMove, f"ply {ply:2}"))
+            if ply + 1 < self.args.maxPly:
+                for m in follow:
+                    child = board.copy()
+                    child.push(board.parse_uci(m))
+                    queue.append(child)
+
+        print(f"Visited {len(seen)} positions, found {len(targets)} targets.")
+        if noise:
+            print(
+                f"Auxiliary searches came out up to {noise} cp better for cdb's move than for the engine's:"
+                " targets with a gap of that size or less may well be noise."
+            )
+        self.summarize(targets)
+        return targets
+
     async def explore(self, target):
         """let cdbsearch explore the position after Stockfish's move, then reprobe the line back to its root"""
+        # a target that is found again after exploring it is explored one depth deeper
+        depth = self.explored[target["epd"]] = (
+            self.explored.get(target["epd"], self.args.exploreDepth - 1) + 1
+        )
         out = StringIO()
         with contextlib.redirect_stdout(out):
             await cdbsearch.cdbsearch(
                 epd=target["epd"],
                 chess960=self.args.chess960,
-                depthLimit=self.args.exploreDepth,
+                depthLimit=depth,
                 timeLimit=None,
                 concurrency=self.args.concurrency,
                 evalDecay=self.args.evalDecay,
@@ -261,7 +488,7 @@ class SFGuide:
             key, _, value = l.partition(":")
             fields[key.strip()] = value.strip()
         print(
-            f"  explored {target['line']} -> {target['move']}: score {fields.get('score')}, PV {' '.join(fields.get('PV', '').split()[:6])} ..., {fields.get('total time')}",
+            f"  explored to depth {depth} {target['line']} -> {target['move']}: score {fields.get('score')}, PV {' '.join(fields.get('PV', '').split()[:6])} ..., {fields.get('total time')}",
             flush=True,
         )
         # cdb updates the scores of a position when it is queried: walk the line back to its root, leaf first
@@ -295,22 +522,46 @@ class SFGuide:
 
 
 async def main(args, root):
-    _, engine = await chess.engine.popen_uci(args.engine)
     options = {"Threads": args.threads, "Hash": args.hash}
     if args.chess960:
         options["UCI_Chess960"] = True
-    await engine.configure(options)
+    if args.live:
+        engine, live = None, LiveEngine()
+        await live.start(args.engine, options)
+        name, budget = (
+            live.name,
+            f"a background search of at least {args.prefillNodes} nodes",
+        )
+    else:
+        _, engine = await chess.engine.popen_uci(args.engine)
+        await engine.configure(options)
+        name = engine.id.get("name")
+        budget = f"{args.nodes} nodes per {'search' if args.pv else 'position'}"
     print(
-        f"Engine       :  {engine.id.get('name')}, {args.threads} threads, {args.hash} MB hash,"
-        f" {args.nodes} nodes per {'search' if args.pv else 'position'}"
+        f"Engine       :  {name}, {args.threads} threads, {args.hash} MB hash, {budget}"
     )
     print(f"Root position:  {root.epd()}")
     print(f"Start date   :  {datetime.now().isoformat()}\n", flush=True)
 
     guide = SFGuide(engine, args)
+    if args.live:
+        # one search from the root keeps running, and keeps filling the TT that we probe
+        guide.live = live
+        live.position(root)
+        live.send("go infinite")
+        last = 0
+        while live.nodes() < args.prefillNodes:
+            await asyncio.sleep(5)
+            if datetime.now().timestamp() - last >= 60:
+                print(f"  background search: {live.status()}", flush=True)
+                last = datetime.now().timestamp()
+        print(flush=True)
+    walk = guide.live_walk if args.live else guide.pv_walk if args.pv else guide.walk
     await guide.report(root)
-    targets = await (guide.pv_walk(root) if args.pv else guide.walk(root))
-    for _ in range(args.rounds):
+    targets = await walk(root)
+    rounds = 0
+    while args.rounds <= 0 or rounds < args.rounds:
+        rounds += 1
         if not args.exploreDepth or not targets:
             break
         print(f"Exploring {min(len(targets), args.maxTargets)} targets.", flush=True)
@@ -318,13 +569,22 @@ async def main(args, root):
             await guide.explore(target)
         print(flush=True)
         await guide.report(root)
-        targets = await (guide.pv_check(root) if args.pv else guide.walk(root))
+        targets = await (guide.pv_check(root) if args.pv else walk(root))
 
     # give cdbsearch's background requests (reprobes and requeues) a chance to finish
-    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    pending = [
+        t
+        for t in asyncio.all_tasks()
+        if t is not asyncio.current_task() and not (args.live and t is live.reader)
+    ]
     if pending:
         await asyncio.wait(pending, timeout=120)
-    await engine.quit()
+    if args.live:
+        await live.request("stop", lambda l: l.startswith("bestmove"))
+        live.send("quit")
+        await live.proc.wait()
+    else:
+        await engine.quit()
 
 
 if __name__ == "__main__":
@@ -383,8 +643,36 @@ if __name__ == "__main__":
         default=3,
     )
     argParser.add_argument(
+        "--live",
+        action="store_true",
+        help="Keep one engine search running from the root, and compare cdb's choices with the TT of that search, probed while it runs. Needs the ttprobe and ttmoves commands of the cdb-tt branch of Stockfish.",
+    )
+    argParser.add_argument(
+        "--prefillNodes",
+        help="With --live: the number of nodes the background search makes before the first walk.",
+        type=int,
+        default=1000000000,
+    )
+    argParser.add_argument(
+        "--minDepth",
+        help="With --live: only trust TT entries of at least this depth.",
+        type=int,
+        default=25,
+    )
+    argParser.add_argument(
+        "--auxNodes",
+        help="With --live: where the TT has no deep entry for a position, find the engine's move with a search of this many nodes on an auxiliary thread, which shares the TT with the background search. With 0, such positions are skipped.",
+        type=int,
+        default=50000000,
+    )
+    argParser.add_argument(
+        "--scoreGap",
+        action="store_true",
+        help="With --live: where the engine's move differs from cdb's, score both with --auxNodes searches on the auxiliary thread, and only explore if the gap is at least --threshold.",
+    )
+    argParser.add_argument(
         "--threshold",
-        help="Minimal advantage in cp, according to the engine, of its move over cdb's best move for a position to become a target. Not used with --pv.",
+        help="Minimal advantage in cp, according to the engine, of its move over cdb's best move for a position to become a target. Not used with --pv, and with --live only with --scoreGap.",
         type=int,
         default=25,
     )
@@ -424,7 +712,7 @@ if __name__ == "__main__":
     )
     argParser.add_argument(
         "--rounds",
-        help="Number of rounds of exploring the targets, each followed by a new walk (with --pv: by comparing cdb with the earlier engine lines again).",
+        help="Number of rounds of exploring the targets, each followed by a new walk (with --pv: by comparing cdb with the earlier engine lines again). With 0, keep going until stopped. A target found again is explored one depth deeper.",
         type=int,
         default=1,
     )

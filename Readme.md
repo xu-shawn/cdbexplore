@@ -174,7 +174,7 @@ python cdbexplore/cdbbulksearch.py book.pgn --forever >& cdbsearch_book.log &
 This is a command line program that uses Stockfish (or any UCI engine) to find the positions where cdb's main lines are likely wrong, and lets `cdbsearch` explore those positions.
 After each exploration, the line is queried once more from its leaf back to its root, so that cdb's scores along it get updated.
 
-It has two modes:
+It has three modes:
 
 * By default, it walks cdb's main line from the root, and asks the engine at every position whether it would play another move.
   Where the engine prefers its own move by at least `--threshold` cp, the position after the engine's move becomes a target, and the walk follows the engine's line as well.
@@ -183,9 +183,16 @@ It has two modes:
 * With `--pv`, it compares cdb's choices with the main line of a long engine search, position by position.
   Where they differ, the position after the engine's move becomes a target, and a further search from the position after cdb's move shows how the engine would refute it (up to `--maxSearches` searches, closest to the root first).
   This suits searches with billions of nodes.
+* With `--live`, one engine search keeps running from the root for as long as the program runs, and keeps deepening its TT.
+  The walk along cdb's main line reads the engine's move at each position from that TT, while the search runs; where the TT has no deep entry, a search on an auxiliary thread, which shares only the TT with the background search, finds the engine's move (`--auxNodes`).
+  Every position where the engine's move differs from cdb's becomes a target, closest to the root first: cdb's own search settles the evals.
+  With `--scoreGap`, both moves are first scored by auxiliary searches, and only gaps of at least `--threshold` cp are explored.
+  With `--rounds 0`, walking and exploring go on until stopped, and a target that is found again is explored one depth deeper.
+  This needs the `ttprobe`, `ttmoves` and `aux*` commands of the [`cdb-tt`](https://github.com/xu-shawn/Stockfish/tree/cdb-tt) branch of Stockfish.
 
 ```
-usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--threshold THRESHOLD] [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--concurrency CONCURRENCY] [--evalDecay EVALDECAY] [--user USER] [--suppressErrors]
+usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--live] [--prefillNodes PREFILLNODES] [--minDepth MINDEPTH] [--auxNodes AUXNODES] [--scoreGap] [--threshold THRESHOLD] [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--concurrency CONCURRENCY]
+                     [--evalDecay EVALDECAY] [--user USER] [--suppressErrors]
 
 Use Stockfish to find the positions where cdb's main lines are likely wrong, and explore those with cdbsearch.
 
@@ -201,8 +208,14 @@ options:
   --pv                  Follow the main lines of long engine searches, instead of searching every position on cdb's main line. Suited to searches with many nodes. (default: False)
   --maxSearches MAXSEARCHES
                         With --pv: the number of engine searches. The first one is from the root, the others refute cdb's choices wherever they differ from the engine's main lines, closest to the root first. (default: 3)
+  --live                Keep one engine search running from the root, and compare cdb's choices with the TT of that search, probed while it runs. Needs the ttprobe and ttmoves commands of the cdb-tt branch of Stockfish. (default: False)
+  --prefillNodes PREFILLNODES
+                        With --live: the number of nodes the background search makes before the first walk. (default: 1000000000)
+  --minDepth MINDEPTH   With --live: only trust TT entries of at least this depth. (default: 25)
+  --auxNodes AUXNODES   With --live: where the TT has no deep entry for a position, find the engine's move with a search of this many nodes on an auxiliary thread, which shares the TT with the background search. With 0, such positions are skipped. (default: 50000000)
+  --scoreGap            With --live: where the engine's move differs from cdb's, score both with --auxNodes searches on the auxiliary thread, and only explore if the gap is at least --threshold. (default: False)
   --threshold THRESHOLD
-                        Minimal advantage in cp, according to the engine, of its move over cdb's best move for a position to become a target. Not used with --pv. (default: 25)
+                        Minimal advantage in cp, according to the engine, of its move over cdb's best move for a position to become a target. Not used with --pv, and with --live only with --scoreGap. (default: 25)
   --side {both,white,black}
                         Only look for better moves of this side. (default: both)
   --maxPly MAXPLY       Walk at most this many plies away from the root. (default: 16)
@@ -212,7 +225,7 @@ options:
                         Explore every target with cdbsearch to this depth. With 0 we only walk and report. (default: 0)
   --maxTargets MAXTARGETS
                         Explore at most this many targets per round, the ones with the largest gap (with --pv: closest to the root) first. (default: 8)
-  --rounds ROUNDS       Number of rounds of exploring the targets, each followed by a new walk (with --pv: by comparing cdb with the earlier engine lines again). (default: 1)
+  --rounds ROUNDS       Number of rounds of exploring the targets, each followed by a new walk (with --pv: by comparing cdb with the earlier engine lines again). With 0, keep going until stopped. A target found again is explored one depth deeper. (default: 1)
   --concurrency CONCURRENCY
                         Argument passed to cdbsearch. (default: 16)
   --evalDecay EVALDECAY
