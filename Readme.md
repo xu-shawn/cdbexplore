@@ -169,4 +169,80 @@ git clone https://github.com/vondele/cdbexplore && pip install -r cdbexplore/req
 python cdbexplore/cdbbulksearch.py book.pgn --forever >& cdbsearch_book.log &
 ```
 
+## `cdbsfguide`
+
+This is a command line program that uses Stockfish (or any UCI engine) to find the positions where cdb's main lines are likely wrong, and lets `cdbsearch` explore those positions.
+After each exploration, the line is queried once more from its leaf back to its root, so that cdb's scores along it get updated.
+
+It has two modes:
+
+* By default, it walks cdb's main line from the root, and asks the engine at every position whether it would play another move.
+  Where the engine prefers its own move by at least `--threshold` cp, the position after the engine's move becomes a target, and the walk follows the engine's line as well.
+  Both moves are scored by the engine, each with a search restricted to that move, as cdb's scale differs from the engine's.
+  This suits short searches: the program reports by how much the engine sometimes preferred cdb's move to its own, which shows what size of gap is just noise.
+* With `--pv`, it compares cdb's choices with the main line of a long engine search, position by position.
+  Where they differ, the position after the engine's move becomes a target, and a further search from the position after cdb's move shows how the engine would refute it (up to `--maxSearches` searches, closest to the root first).
+  This suits searches with billions of nodes.
+
+```
+usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--threshold THRESHOLD] [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--concurrency CONCURRENCY] [--evalDecay EVALDECAY] [--user USER] [--suppressErrors]
+
+Use Stockfish to find the positions where cdb's main lines are likely wrong, and explore those with cdbsearch.
+
+options:
+  -h, --help            show this help message and exit
+  --epd EPD             EPD/FEN to start from: acceptable are FENs w/ and w/o move counters, as well as the extended "['startpos'|FEN] moves m1 m2 m3" syntax. (default: startpos)
+  --san SAN             Moves in SAN notation that lead to the position to start from. E.g. "1. e4". (default: None)
+  --chess960            Enable chess960. (default: False)
+  --engine ENGINE       Path to the Stockfish (or any UCI engine) binary. (default: stockfish)
+  --threads THREADS     Number of threads for the engine. (default: 4)
+  --hash HASH           Hash size in MB for the engine. (default: 1024)
+  --nodes NODES         Number of nodes the engine searches per position (three times where it disagrees with cdb), or per search with --pv. (default: 10000000)
+  --pv                  Follow the main lines of long engine searches, instead of searching every position on cdb's main line. Suited to searches with many nodes. (default: False)
+  --maxSearches MAXSEARCHES
+                        With --pv: the number of engine searches. The first one is from the root, the others refute cdb's choices wherever they differ from the engine's main lines, closest to the root first. (default: 3)
+  --threshold THRESHOLD
+                        Minimal advantage in cp, according to the engine, of its move over cdb's best move for a position to become a target. Not used with --pv. (default: 25)
+  --side {both,white,black}
+                        Only look for better moves of this side. (default: both)
+  --maxPly MAXPLY       Walk at most this many plies away from the root. (default: 16)
+  --maxNodes MAXNODES   Analyse at most this many positions per walk. Not used with --pv. (default: 60)
+  --targets TARGETS     Write the targets of the last walk to this file, in the extended EPD syntax understood by cdbbulksearch. (default: None)
+  --exploreDepth EXPLOREDEPTH
+                        Explore every target with cdbsearch to this depth. With 0 we only walk and report. (default: 0)
+  --maxTargets MAXTARGETS
+                        Explore at most this many targets per round, the ones with the largest gap (with --pv: closest to the root) first. (default: 8)
+  --rounds ROUNDS       Number of rounds of exploring the targets, each followed by a new walk (with --pv: by comparing cdb with the earlier engine lines again). (default: 1)
+  --concurrency CONCURRENCY
+                        Argument passed to cdbsearch. (default: 16)
+  --evalDecay EVALDECAY
+                        Argument passed to cdbsearch. (default: 2)
+  --user USER           Argument passed to cdbsearch. (default: None)
+  --suppressErrors      Argument passed to cdbsearch. (default: False)
+```
+
+Sample output (excerpt), for a walk after 1. e4 with 20M nodes per position and `--threshold 15`:
+
+```
+> python cdbsfguide.py --epd "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQ - 0 1 moves e2e4" --engine stockfish --threads 8 --hash 2048 --nodes 20000000 --threshold 15 --exploreDepth 6
+cdb at the root: c6 -120, c5 -121, e5 -129, Nc6 -129, d6 -139
+cdb for e4 at its parent: +120
+
+  ply  0 B  cdb     c6  -120 | SF     c5 (cdb  -121)   -85 vs  -102, gap 17         TARGET | (root)
+  ply  1 W  cdb     c4  +120 | SF     d4 (cdb  +100)   +87 vs  +100, gap -13               | 1...c6
+  ply  1 W  cdb    Nf3  +121 | agree       SF   +96                                        | 1...c5
+  ...
+  ply  7 W  cdb   Bb5+  +120 | SF    Nc3 (cdb  +108)  +143 vs  +120, gap 23         TARGET | 1...c6 2. c4 d5 3. cxd5 cxd5 4. exd5 Nf6
+  ...
+Exploring 3 targets.
+  explored 1...c6 2. c4 d5 3. cxd5 cxd5 4. exd5 Nf6 -> Nc3: score -103, PV f6d5 f1c4 d5b4 g1f3 b4d3 e1e2 ..., 0:03:07.48
+  explored 1...c5 2. Nf3 Nc6 3. Bb5 d6 4. O-O Bd7 5. c3 Nf6 6. d4 Nxe4 7. Re1 Nf6 8. d5 Ne5 -> Bf1: score -107, PV e5f3 d1f3 e7e6 d5e6 f7e6 f3b7 ..., 0:02:43.27
+  explored (root) -> c5: score 114, PV g1f3 b8c6 f1b5 d7d6 e1g1 c8d7 ..., 0:03:35.13
+
+cdb at the root: c5 -111, c6 -120, e5 -129, Nc6 -129, d6 -139
+cdb for e4 at its parent: +111
+```
+
+Scores are from the point of view of the side to move. For each position, the line shows cdb's best move and score, and either that the engine agrees, or the engine's move (with cdb's score for it), the engine's scores for its move and cdb's move, and the gap between the two.
+
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
