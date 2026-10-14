@@ -1,9 +1,19 @@
-import argparse, asyncio, contextlib
+import argparse, asyncio, contextlib, json, random, time
 import chess, chess.engine, chess.pgn
 import cdbsearch
 from io import StringIO
 from datetime import datetime, timedelta
 from multiprocessing import freeze_support
+
+
+def path_epds(board):
+    """the positions on the way from the root of board's move stack to board itself"""
+    b = board.root()
+    epds = [b.epd()]
+    for m in board.move_stack:
+        b.push(m)
+        epds.append(b.epd())
+    return epds
 
 
 def tt_score(kind, n):
@@ -80,9 +90,27 @@ class LiveEngine:
         self.send(cmd)
         lines = []
         while True:
-            lines.append(await self.replies.get())
+            try:
+                lines.append(await asyncio.wait_for(self.replies.get(), timeout=60))
+            except asyncio.TimeoutError:
+                if self.reader.done():
+                    raise RuntimeError(f"the engine stopped while we waited for: {cmd}")
+                continue
             if last(lines[-1]):
                 return lines
+
+    def background(self):
+        """the state of the background search, for the statistics"""
+        t = self.info.split()
+        if "nodes" not in t:
+            return {}
+        i = t.index("score")
+        return {
+            "depth": int(t[t.index("depth") + 1]),
+            "nodes": int(t[t.index("nodes") + 1]),
+            "score": tt_score(t[i + 1], int(t[i + 2])),
+            "pv": t[t.index("pv") + 1 :][:12],
+        }
 
     def status(self):
         """depth, nodes, score and the start of the PV of the background search"""
@@ -142,6 +170,37 @@ class SFGuide:
         self.engine = engine
         self.args = args
         self.explored = {}  # the depth to which each target has been explored
+        # for the statistics: the round, the positions where cdb disagreed with the engine in the
+        # first walk, and the positions whose engine move has been explored
+        self.stats = open(args.stats, "a") if args.stats else None
+        self.round, self.baseline, self.exploredAt = 0, None, set()
+        self.measureDB = None  # for fresh queries of cdb
+        self.heldOut = (
+            set()
+        )  # positions of the first walk that are never explored, as a control
+
+    def log(self, event, **record):
+        """append a record to the statistics file, see cdbsfguide_stats.py"""
+        if self.stats:
+            record = {
+                "time": datetime.now().isoformat(),
+                "round": self.round,
+                "event": event,
+                **record,
+            }
+            self.stats.write(json.dumps(record) + "\n")
+            self.stats.flush()
+
+    async def cdb_view(self, board, move):
+        """cdb's current best move at board, its score, and cdb's score for the given move"""
+        if self.measureDB is None:
+            self.measureDB = self.chessdb(board)
+        scored = await self.measureDB.queryall(board.epd(), board.chess960, skipTT=True)
+        moves = {m: s for m, s in scored.items() if m != "depth"}
+        if not moves:
+            return {"best": None, "bestScore": None, "score": None}
+        best = max(moves, key=lambda m: moves[m])
+        return {"best": best, "bestScore": moves[best], "score": moves.get(move)}
 
     def chessdb(self, board):
         """a fresh ChessDB, so that we see cdb's current scores rather than cached ones"""
@@ -202,6 +261,8 @@ class SFGuide:
             "why": why,
             "ply": len(board.move_stack),
             "line": board.root().variation_san(board.move_stack) or "(root)",
+            "parent": board.epd(),
+            "path": path_epds(board),
             "move": board.san(move),
             "epd": board.root().fen()
             + " moves "
@@ -376,6 +437,7 @@ class SFGuide:
         """walk cdb's main line from root, comparing cdb's choices with the TT of the background search"""
         chessdb = self.chessdb(root)
         queue, seen, targets = [root.copy()], set(), []
+        agree, noData, disagreements = 0, 0, []
         # the largest amount by which the auxiliary searches preferred cdb's move to the engine's
         noise = 0
         print(f"Walk from {root.epd()}, {datetime.now().isoformat()}", flush=True)
@@ -420,9 +482,11 @@ class SFGuide:
             if sfMove is None:
                 verdict = f"no deep TT entry (depth {node.get('depth', '-')})"
                 target, follow = False, []
+                noData += 1
             elif board.uci(sfMove) == cdbBest:
                 verdict = f"agree   {source} {bounded(children.get(cdbBest)) if source == 'TT' else ''}"
                 target, follow = False, [cdbBest]
+                agree += 1
             else:
                 # Any disagreement is worth exploring: cdb's search settles the evals. Only with
                 # --scoreGap we first measure it, with equal budgets for both moves on the
@@ -431,6 +495,8 @@ class SFGuide:
                 s, c = children.get(sfBest, {}), children.get(cdbBest, {})
                 note = f"TT {bounded(s)} vs {bounded(c)}"
                 target = self.args.side in ["both", side]
+                if target:
+                    disagreements.append((board.copy(), sfBest, line or "(root)", ply))
                 if target and self.args.scoreGap:
                     _, sScore = await self.live.aux_search(
                         board, self.args.auxNodes, sfMove
@@ -462,6 +528,67 @@ class SFGuide:
                 f"Auxiliary searches came out up to {noise} cp better for cdb's move than for the engine's:"
                 " targets with a gap of that size or less may well be noise."
             )
+
+        # The disagreements of the first walk are a fixed set to measure progress on: does cdb now
+        # play the engine's move there? Those never explored show cdb's drift without us.
+        if self.baseline is None:
+            self.baseline = disagreements
+            # a random part of them is never explored, to tell our effect from cdb's drift
+            # (and neither are the positions below them, which share in their scores)
+            eligible = [d for d in disagreements if d[3] >= self.args.holdoutPly]
+            k = round(self.args.holdout * len(eligible))
+            heldOut = random.Random(self.args.seed).sample(eligible, k)
+            self.heldOut = {b.epd() for b, _, _, _ in heldOut}
+            if k:
+                print(
+                    f"Holding out {k} of the {len(eligible)} disagreements of the first walk at least {self.args.holdoutPly} plies deep from exploration, with the lines below them, as a control."
+                )
+        kept = [t for t in targets if not self.heldOut.intersection(t["path"])]
+        if len(kept) < len(targets):
+            print(f"Leaving out {len(targets) - len(kept)} targets in held out lines.")
+        targets = kept
+        baseline = []
+        for b, m, l, _ in self.baseline:
+            v = await self.cdb_view(b, m)
+            gap = (
+                v["bestScore"] - v["score"]
+                if None not in (v["bestScore"], v["score"])
+                else None
+            )
+            baseline.append(
+                {
+                    "line": l,
+                    "move": m,
+                    "explored": b.epd() in self.exploredAt,
+                    "heldOut": b.epd() in self.heldOut,
+                    "resolved": v["best"] == m,
+                    "cdbGap": gap,
+                }
+            )
+        for label, group in [
+            ("explored", [b for b in baseline if b["explored"]]),
+            ("held out", [b for b in baseline if b["heldOut"]]),
+            (
+                "not explored yet",
+                [b for b in baseline if not b["explored"] and not b["heldOut"]],
+            ),
+        ]:
+            if group:
+                print(
+                    f"Baseline: {sum(b['resolved'] for b in group)} of {len(group)} disagreements of the first walk"
+                    f" ({label}) now resolved."
+                )
+        self.log(
+            "walk",
+            background=self.live.background(),
+            root=await self.cdb_moves(self.chessdb(root), root),
+            positions=len(seen),
+            agree=agree,
+            disagree=len(disagreements),
+            noData=noData,
+            targets=len(targets),
+            baseline=baseline,
+        )
         self.summarize(targets)
         return targets
 
@@ -471,6 +598,15 @@ class SFGuide:
         depth = self.explored[target["epd"]] = (
             self.explored.get(target["epd"], self.args.exploreDepth - 1) + 1
         )
+        epd, _, moves = target["epd"].partition(" moves ")
+        leaf = chess.Board(epd, chess960=self.args.chess960)
+        for m in moves.split():
+            leaf.push(leaf.parse_uci(m))
+        parent = leaf.copy()
+        move = parent.uci(parent.pop())
+        before = await self.cdb_view(parent, move)
+        start = time.time()
+
         out = StringIO()
         with contextlib.redirect_stdout(out):
             await cdbsearch.cdbsearch(
@@ -492,16 +628,32 @@ class SFGuide:
             flush=True,
         )
         # cdb updates the scores of a position when it is queried: walk the line back to its root, leaf first
-        epd, _, moves = target["epd"].partition(" moves ")
-        board = chess.Board(epd, chess960=self.args.chess960)
-        for m in moves.split():
-            board.push(board.parse_uci(m))
+        board = leaf.copy()
         chessdb = self.chessdb(board)
         while True:
             await chessdb.queryall(board.epd(), board.chess960, skipTT=True)
             if not board.move_stack:
                 break
             board.pop()
+
+        after = await self.cdb_view(parent, move)
+        self.exploredAt.add(parent.epd())
+        print(
+            f"    cdb before: best {before['best']} {before['bestScore']}, {move} {before['score']};"
+            f" after: best {after['best']} {after['bestScore']}, {move} {after['score']}",
+            flush=True,
+        )
+        self.log(
+            "explore",
+            line=target["line"],
+            move=move,
+            depth=depth,
+            before=before,
+            after=after,
+            seconds=round(time.time() - start),
+            enqueued=int(fields.get("enqueued") or 0),
+            positions=int((fields.get("chessdbq") or "0").split()[0]),
+        )
 
     async def report(self, root):
         """show cdb's current view of root, and of the move leading to it"""
@@ -544,6 +696,29 @@ async def main(args, root):
     print(f"Start date   :  {datetime.now().isoformat()}\n", flush=True)
 
     guide = SFGuide(engine, args)
+    guide.log("start", root=root.epd(), engine=name, args=vars(args))
+    try:
+        await run(args, root, guide, engine, live if args.live else None)
+    finally:
+        guide.log("stop")
+        if args.live and live.proc.returncode is None:
+            live.send("stop")
+            live.send("quit")
+
+
+async def run(args, root, guide, engine, live):
+    """the rounds of walking and exploring"""
+
+    async def safely(f, *a):
+        # in long runs, an error in one exploration or walk should not end the run
+        try:
+            return await f(*a)
+        except Exception as ex:
+            if args.live and live.reader.done():
+                raise
+            print(f"  error: {ex!r}", flush=True)
+            guide.log("error", message=repr(ex))
+
     if args.live:
         # one search from the root keeps running, and keeps filling the TT that we probe
         guide.live = live
@@ -562,18 +737,27 @@ async def main(args, root):
     rounds = 0
     while args.rounds <= 0 or rounds < args.rounds:
         rounds += 1
-        if not args.exploreDepth or not targets:
+        guide.round = rounds
+        if not args.exploreDepth:
             break
+        if not targets:
+            if args.rounds > 0 or not args.live:
+                break
+            # a run without end: the background search goes on, and so may cdb's view change
+            print("No targets: walking again in 10 minutes.", flush=True)
+            await asyncio.sleep(600)
+            targets = await safely(walk, root) or []
+            continue
         # The most important targets are chosen, and then explored deepest first: cdb updates the
         # scores of a position when it is queried, so fixing a line from the bottom up lets the
         # corrections of the deeper positions reach the ones above them.
         chosen = sorted(targets[: args.maxTargets], key=lambda t: -t["ply"])
         print(f"Exploring {len(chosen)} targets, deepest first.", flush=True)
         for target in chosen:
-            await guide.explore(target)
+            await safely(guide.explore, target)
         print(flush=True)
-        await guide.report(root)
-        targets = await (guide.pv_check(root) if args.pv else walk(root))
+        await safely(guide.report, root)
+        targets = await safely(guide.pv_check if args.pv else walk, root) or []
 
     # give cdbsearch's background requests (reprobes and requeues) a chance to finish
     pending = [
@@ -717,6 +901,28 @@ if __name__ == "__main__":
     argParser.add_argument(
         "--rounds",
         help="Number of rounds of exploring the targets, each followed by a new walk (with --pv: by comparing cdb with the earlier engine lines again). With 0, keep going until stopped. A target found again is explored one depth deeper.",
+        type=int,
+        default=1,
+    )
+    argParser.add_argument(
+        "--stats",
+        help="Append statistics of the walks and explorations to this file (JSON lines), see cdbsfguide_stats.py.",
+    )
+    argParser.add_argument(
+        "--holdout",
+        help="With --live: the fraction of the first walk's disagreements that is never explored, as a control group for --stats.",
+        type=float,
+        default=0.0,
+    )
+    argParser.add_argument(
+        "--holdoutPly",
+        help="With --holdout: only disagreements at least this many plies from the root are held out. Positions below them are not explored either.",
+        type=int,
+        default=4,
+    )
+    argParser.add_argument(
+        "--seed",
+        help="Seed for choosing the held out disagreements.",
         type=int,
         default=1,
     )

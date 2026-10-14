@@ -193,9 +193,20 @@ It has three modes:
 In each round, the targets that are explored (`--maxTargets`) are explored deepest first, and every exploration ends by querying its line from the leaf back to the root.
 As cdb updates the scores of a position when it is queried, this fixes cdb's evals from the bottom up.
 
+To measure the effect of a run, `--stats FILE` appends statistics to `FILE` (JSON lines): at every walk, cdb's scores of the root moves and how often cdb agrees with the engine; for every exploration, cdb's best move and its score of the engine's move, before and after.
+The disagreements of the first walk serve as a fixed set: every walk records whether cdb now plays the engine's move there.
+With `--holdout`, a random part of them (at least `--holdoutPly` plies from the root) is never explored, nor are the lines below them, as a control group: comparing the explored disagreements with the held out ones tells the effect of the run from cdb's own drift.
+`cdbsfguide_stats.py FILE --plot FILE.png` summarises such a file.
+
+Example of a run without end, with a control group, for the start position in which only White may castle:
+```shell
+python cdbsfguide.py --live --epd "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQ - 0 1" --engine Stockfish/src/stockfish --threads 5 --hash 32768 --minDepth 30 --exploreDepth 6 --rounds 0 --holdout 0.3 --stats kq.jsonl >& kq.log &
+python cdbsfguide_stats.py kq.jsonl --plot kq.png
 ```
-usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--live] [--prefillNodes PREFILLNODES] [--minDepth MINDEPTH] [--auxNodes AUXNODES] [--scoreGap] [--threshold THRESHOLD] [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--concurrency CONCURRENCY]
-                     [--evalDecay EVALDECAY] [--user USER] [--suppressErrors]
+
+```
+usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--live] [--prefillNodes PREFILLNODES] [--minDepth MINDEPTH] [--auxNodes AUXNODES] [--scoreGap] [--threshold THRESHOLD] [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--stats STATS] [--holdout HOLDOUT]
+                     [--holdoutPly HOLDOUTPLY] [--seed SEED] [--concurrency CONCURRENCY] [--evalDecay EVALDECAY] [--user USER] [--suppressErrors]
 
 Use Stockfish to find the positions where cdb's main lines are likely wrong, and explore those with cdbsearch.
 
@@ -229,6 +240,11 @@ options:
   --maxTargets MAXTARGETS
                         Explore at most this many targets per round: the ones with the largest gap (with --pv and --live: closest to the root). They are explored deepest first, so that cdb's evals get fixed from the bottom up. (default: 8)
   --rounds ROUNDS       Number of rounds of exploring the targets, each followed by a new walk (with --pv: by comparing cdb with the earlier engine lines again). With 0, keep going until stopped. A target found again is explored one depth deeper. (default: 1)
+  --stats STATS         Append statistics of the walks and explorations to this file (JSON lines), see cdbsfguide_stats.py. (default: None)
+  --holdout HOLDOUT     With --live: the fraction of the first walk's disagreements that is never explored, as a control group for --stats. (default: 0.0)
+  --holdoutPly HOLDOUTPLY
+                        With --holdout: only disagreements at least this many plies from the root are held out. Positions below them are not explored either. (default: 4)
+  --seed SEED           Seed for choosing the held out disagreements. (default: 1)
   --concurrency CONCURRENCY
                         Argument passed to cdbsearch. (default: 16)
   --evalDecay EVALDECAY
