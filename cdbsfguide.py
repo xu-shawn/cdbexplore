@@ -48,7 +48,7 @@ class LiveEngine:
     needs the ttprobe and ttmoves commands of the cdb-tt branch of Stockfish"""
 
     async def start(self, path, options):
-        self.info, self.auxInfo, self.name = "", "", path
+        self.info, self.auxInfo, self.name, self.nodesSeen = "", "", path, 0
         self.replies = asyncio.Queue()
         self.proc = await asyncio.create_subprocess_exec(
             path,
@@ -70,6 +70,10 @@ class LiveEngine:
                 if " pv " in line and "bound" not in line:
                     self.auxInfo = line
             elif line.startswith("info"):
+                # iterations of a long search take long: count nodes from every line with them
+                t = line.split()
+                if "nodes" in t:
+                    self.nodesSeen = int(t[t.index("nodes") + 1])
                 # remember the latest complete iteration of the background search
                 if (
                     line.startswith("info depth")
@@ -107,7 +111,7 @@ class LiveEngine:
         i = t.index("score")
         return {
             "depth": int(t[t.index("depth") + 1]),
-            "nodes": int(t[t.index("nodes") + 1]),
+            "nodes": self.nodesSeen,
             "score": tt_score(t[i + 1], int(t[i + 2])),
             "pv": t[t.index("pv") + 1 :][:12],
         }
@@ -119,11 +123,10 @@ class LiveEngine:
             return "just started"
         i = t.index("score")
         pv = " ".join(t[t.index("pv") + 1 :][:6])
-        return f"depth {t[t.index('depth') + 1]}, {int(t[t.index('nodes') + 1]) / 1e9:.2f}B nodes, {t[i + 1]} {t[i + 2]}, pv {pv} ..."
+        return f"depth {t[t.index('depth') + 1]}, {self.nodesSeen / 1e9:.2f}B nodes, {t[i + 1]} {t[i + 2]}, pv {pv} ..."
 
     def nodes(self):
-        t = self.info.split()
-        return int(t[t.index("nodes") + 1]) if "nodes" in t else 0
+        return self.nodesSeen
 
     def position(self, board):
         """set the engine's position to the one on board, with the moves leading to it"""
