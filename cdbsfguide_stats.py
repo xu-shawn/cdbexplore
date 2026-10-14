@@ -26,6 +26,8 @@ def fraction(n, d):
 
 GROUPS = {
     "explored": lambda b: b["explored"],
+    # the held out disagreements are leaves: compare them with the explored leaves
+    "explored leaves": lambda b: b["explored"] and b.get("leaf", False),
     "held out": lambda b: b.get("heldOut", False),
     "not explored yet": lambda b: not b["explored"] and not b.get("heldOut", False),
 }
@@ -81,7 +83,7 @@ def main():
     print(
         f"\n{'time':<16} {'round':>5} {'background':>17} | "
         + " ".join(f"{m:>6}" for m in moves)
-        + " | agree / walked | baseline resolved: explored, held out, not explored yet"
+        + " | agree / walked | baseline resolved: explored, explored leaves, held out, not explored yet"
     )
     for w in walks:
         bg = w["background"]
@@ -90,7 +92,8 @@ def main():
         compared = w["agree"] + w["disagree"]
         print(
             f"{w['time'][:16]:<16} {w['round']:>5} {bgs:>17} | {root} | {fraction(w['agree'], compared):>14} |"
-            f" {fraction(*baseline_counts(w, 'explored')):>12}, {fraction(*baseline_counts(w, 'held out')):>12},"
+            f" {fraction(*baseline_counts(w, 'explored')):>12}, {fraction(*baseline_counts(w, 'explored leaves')):>12},"
+            f" {fraction(*baseline_counts(w, 'held out')):>12},"
             f" {fraction(*baseline_counts(w, 'not explored yet'))}"
         )
 

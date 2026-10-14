@@ -178,9 +178,9 @@ class SFGuide:
         self.stats = open(args.stats, "a") if args.stats else None
         self.round, self.baseline, self.exploredAt = 0, None, set()
         self.measureDB = None  # for fresh queries of cdb
-        self.heldOut = (
-            set()
-        )  # positions of the first walk that are never explored, as a control
+        # positions of the first walk that are never explored, as a control, and those of its
+        # disagreements without other ones below them
+        self.heldOut, self.leaves = set(), set()
 
     def log(self, event, **record):
         """append a record to the statistics file, see cdbsfguide_stats.py"""
@@ -260,12 +260,15 @@ class SFGuide:
 
     def target(self, board, move, why):
         """a target: the position after move, in the extended EPD syntax"""
+        after = board.copy()
+        after.push(move)
         return {
             "why": why,
             "ply": len(board.move_stack),
             "line": board.root().variation_san(board.move_stack) or "(root)",
             "parent": board.epd(),
-            "path": path_epds(board),
+            # the positions from the root to the target itself
+            "path": path_epds(board) + [after.epd()],
             "move": board.san(move),
             "epd": board.root().fen()
             + " moves "
@@ -536,15 +539,24 @@ class SFGuide:
         # play the engine's move there? Those never explored show cdb's drift without us.
         if self.baseline is None:
             self.baseline = disagreements
-            # a random part of them is never explored, to tell our effect from cdb's drift
-            # (and neither are the positions below them, which share in their scores)
-            eligible = [d for d in disagreements if d[3] >= self.args.holdoutPly]
+            # A random part of them is never explored, to tell our effect from cdb's drift, nor
+            # are the lines below them, which share in their scores. So that this costs little,
+            # only those without other disagreements below them (leaves) are held out.
+            above = set()
+            for b, _, _, _ in disagreements:
+                above.update(path_epds(b)[:-1])
+            self.leaves = {d[0].epd() for d in disagreements if d[0].epd() not in above}
+            eligible = [
+                d
+                for d in disagreements
+                if d[3] >= self.args.holdoutPly and d[0].epd() in self.leaves
+            ]
             k = round(self.args.holdout * len(eligible))
             heldOut = random.Random(self.args.seed).sample(eligible, k)
             self.heldOut = {b.epd() for b, _, _, _ in heldOut}
             if k:
                 print(
-                    f"Holding out {k} of the {len(eligible)} disagreements of the first walk at least {self.args.holdoutPly} plies deep from exploration, with the lines below them, as a control."
+                    f"Holding out {k} of the {len(eligible)} disagreements of the first walk that are at least {self.args.holdoutPly} plies deep, with no other ones below them, from exploration, as a control."
                 )
         kept = [t for t in targets if not self.heldOut.intersection(t["path"])]
         if len(kept) < len(targets):
@@ -564,6 +576,7 @@ class SFGuide:
                     "move": m,
                     "explored": b.epd() in self.exploredAt,
                     "heldOut": b.epd() in self.heldOut,
+                    "leaf": b.epd() in self.leaves,
                     "resolved": v["best"] == m,
                     "cdbGap": gap,
                 }
@@ -913,7 +926,7 @@ if __name__ == "__main__":
     )
     argParser.add_argument(
         "--holdout",
-        help="With --live: the fraction of the first walk's disagreements that is never explored, as a control group for --stats.",
+        help="With --live: the fraction of the first walk's disagreements without other ones below them (leaves) that is never explored, as a control group for --stats.",
         type=float,
         default=0.0,
     )
