@@ -2,6 +2,8 @@
 Summarise the statistics of a cdbsfguide.py run (--stats), to measure its effect on cdb:
 cdb's scores at the root, its agreement with the engine along the walks, and what became of
 the disagreements of the first walk, for those that were explored and those that were not.
+For a run with --refute: cdb's scores at the root at every round, and what became of the
+positions whose lines were repaired.
 """
 
 import argparse, json
@@ -71,6 +73,13 @@ def main():
     print(f"{len(runs)} run(s) in {args.stats}; this one started {start['time']}")
     if start["event"] == "start":
         print(f"  engine {start['engine']}, root {start['root']}")
+    if (
+        any(r["event"] == "candidate" for r in run)
+        or not walks
+        and any(r["event"] == "round" for r in run)
+    ):
+        refute_summary(run, args)
+        return
     if not walks:
         print("  no walks yet")
         return
@@ -139,6 +148,107 @@ def main():
 
     if args.plot:
         plot(walks, explores, moves, args.plot)
+
+
+def gap(view):
+    """by how much cdb prefers its best move to the engine's move, None if it has no score for that"""
+    return (
+        None if view["engineMove"] is None else view["bestScore"] - view["engineMove"]
+    )
+
+
+def refute_summary(run, args):
+    rounds = [r for r in run if r["event"] == "round"]
+    walks = {r["round"]: r for r in run if r["event"] == "pvwalk"}
+    candidates = [r for r in run if r["event"] == "candidate"]
+    errors = [r for r in run if r["event"] == "error"]
+    if not rounds:
+        print("  no rounds yet")
+        return
+    moves = (
+        args.moves.split(",")
+        if args.moves
+        else sorted(rounds[0]["root"], key=rounds[0]["root"].get, reverse=True)[:3]
+    )
+    print(
+        f"\n{'time':<16} {'round':>5} {'background':>17} | "
+        + " ".join(f"{m:>6}" for m in moves)
+        + " | PV disagreements | repaired: positions, fixes, searches"
+    )
+    for r in rounds:
+        bg = r["background"]
+        bgs = f"d{bg['depth']} {bg['nodes'] / 1e9:7.1f}B" if bg else "-"
+        root = " ".join(f"{r['root'].get(m, 0):+6}" for m in moves)
+        w = walks.get(r["round"])
+        mine = [c for c in candidates if c["round"] == r["round"]]
+        print(
+            f"{r['time'][:16]:<16} {r['round']:>5} {bgs:>17} | {root} | {w['disagreements'] if w else '-':>17} |"
+            f" {len(mine)}, {sum(c['fixes'] for c in mine)}, {sum(c['searches'] for c in mine)}"
+        )
+    if candidates:
+        n = len(candidates)
+        adopted = sum(c["after"]["best"] == c["engineMove"] for c in candidates)
+        changed = sum(c["after"]["best"] != c["before"]["best"] for c in candidates)
+        both = [
+            c for c in candidates if None not in (gap(c["before"]), gap(c["after"]))
+        ]
+        narrowed = sum(gap(c["after"]) < gap(c["before"]) for c in both)
+        dgap = sum(gap(c["after"]) - gap(c["before"]) for c in both) / max(len(both), 1)
+        dbest = (
+            sum(c["after"]["bestScore"] - c["before"]["bestScore"] for c in candidates)
+            / n
+        )
+        print(
+            f"\n{n} repairs of {len({c['line'] for c in candidates})} positions, {sum(c['searches'] for c in candidates)} short searches:"
+            f" cdb's best move changed in {fraction(changed, n)}, to the engine's move in {fraction(adopted, n)};"
+            f" cdb's preference of its best move over the engine's narrowed in {fraction(narrowed, len(both))} (by {dgap:+.1f} cp on average),"
+            f" and its score of its best move changed by {dbest:+.1f} cp on average."
+        )
+    if errors:
+        print(f"{len(errors)} errors, the last one: {errors[-1]['message']}")
+    # the scores at the root after the last round, or at its start if it has not ended
+    ends = [r for r in run if r["event"] == "roundEnd"]
+    first = rounds[0]
+    last = ends[-1] if ends and ends[-1]["time"] > rounds[-1]["time"] else rounds[-1]
+    print(f"\nFrom the first round ({first['time'][:16]}) to {last['time'][:16]}:")
+    for m in moves:
+        a, b = first["root"].get(m), last["root"].get(m)
+        if None not in (a, b):
+            print(f"  cdb's score of {m} at the root: {a:+} -> {b:+}")
+    if args.plot:
+        plot_refute(rounds, candidates, moves, args.plot)
+
+
+def plot_refute(rounds, candidates, moves, path):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    t = [datetime.fromisoformat(r["time"]) for r in rounds]
+    _, axes = plt.subplots(2, 1, figsize=(8, 7), sharex=True)
+    for m in moves:
+        axes[0].plot(
+            t, [r["root"].get(m) for r in rounds], marker="o", markersize=3, label=m
+        )
+    axes[0].set_ylabel("cdb score at the root")
+    axes[0].legend(fontsize=8)
+    tc = [datetime.fromisoformat(c["time"]) for c in candidates]
+    adopted, cum = 0, []
+    for c in candidates:
+        adopted += c["after"]["best"] == c["engineMove"]
+        cum.append(adopted)
+    axes[1].plot(tc, range(1, len(tc) + 1), label="repaired positions")
+    axes[1].plot(tc, cum, label="cdb then played the engine's move")
+    axes[1].set_ylabel("cumulative")
+    axes[1].legend(fontsize=8)
+    for ax in axes:
+        ax.grid(alpha=0.4, linewidth=0.5)
+    axes[1].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+    plt.setp(axes[1].get_xticklabels(), rotation=45, ha="right", fontsize=7)
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"\nPlotted to {path}.")
 
 
 def plot(walks, explores, moves, path):

@@ -194,8 +194,8 @@ class ChessDB:
                     return content
                 retries -= 1
 
-    async def add_cdb_pv_positions(self, epd, chess960):
-        """query cdb for the PV of the position and create a dictionary containing these positions and their distance to the PV leaf for extensions during search"""
+    async def querypv(self, epd):
+        """cdb's PV of the position, to the leaf of its tree, or None if cdb has none"""
         content, first = {}, True
         while not (content and "status" in content):
             content = await self.__cdbapicall(
@@ -206,7 +206,13 @@ class ChessDB:
             else:
                 await asyncio.sleep(5)
         if content["status"] == "ok" and "pv" in content:
-            pv = content["pv"]
+            return content["pv"]
+        return None
+
+    async def add_cdb_pv_positions(self, epd, chess960):
+        """query cdb for the PV of the position and create a dictionary containing these positions and their distance to the PV leaf for extensions during search"""
+        pv = await self.querypv(epd)
+        if pv is not None:
             self.cdbPvToLeaf[epd] = len(pv)
             asyncio.ensure_future(self.queryall(epd, chess960))
             board = chess.Board(epd, chess960=chess960)

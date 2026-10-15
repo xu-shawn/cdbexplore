@@ -43,6 +43,10 @@ def parse_tt(line):
     return d
 
 
+# a score at which a position is decided, so that cdb's exact score of it does not matter
+DECIDED = 400
+
+
 class LiveEngine:
     """a UCI engine with a search running in the background, whose TT we probe meanwhile: this
     needs the ttprobe and ttmoves commands of the cdb-tt branch of Stockfish"""
@@ -156,6 +160,48 @@ class LiveEngine:
         i = t.index("score")
         return board.parse_uci(best), tt_score(t[i + 1], int(t[i + 2]))
 
+    def to_moves(self, board, ucis):
+        """the legal beginning of a list of uci moves from board"""
+        b, moves = board.copy(), []
+        for u in ucis:
+            try:
+                m = b.parse_uci(u)
+            except ValueError:
+                break
+            moves.append(m)
+            b.push(m)
+        return moves
+
+    async def aux_line(self, board, nodes, move=None):
+        """a search of the auxiliary threads of the position on board without the moves that led to
+        it, as cdb sees it: its PV, possibly restricted to a move, and its score for the side to move
+        """
+        self.auxInfo = ""
+        self.send(f"auxposition fen {board.fen()}")
+        restrict = f" searchmoves {board.uci(move)}" if move else ""
+        await self.request(
+            f"auxgo nodes {nodes}{restrict}", lambda l: l.startswith("aux bestmove")
+        )
+        t = self.auxInfo.split()
+        if "score" not in t or "pv" not in t:
+            return [], None
+        i = t.index("score")
+        pv = self.to_moves(board, t[t.index("pv") + 1 :])
+        return pv, tt_score(t[i + 1], int(t[i + 2]))
+
+    async def ttpv(self, board, plies):
+        """the PV formed by the TT moves from board"""
+        self.position(board)
+        line = (await self.request(f"ttpv {plies}", lambda l: l.startswith("ttpv")))[-1]
+        return self.to_moves(board, line.split()[1:])
+
+    async def probe(self, board):
+        """the TT entry of the position on board"""
+        self.position(board)
+        return parse_tt(
+            (await self.request("ttprobe", lambda l: l.startswith("ttprobe")))[-1]
+        )
+
     async def tt(self, board):
         """the TT entry of the position on board, and those of the positions after its legal moves"""
         self.position(board)
@@ -181,6 +227,9 @@ class SFGuide:
         # positions of the first walk that are never explored, as a control, and those of its
         # disagreements without other ones below them
         self.heldOut, self.leaves = set(), set()
+        # with --refute: how often the lines at each position have been repaired, and the positions
+        # where cdb agreed with the engine, or could not be brought closer, with cdb's score then
+        self.repaired, self.agreed, self.stalled = {}, {}, {}
 
     def log(self, event, **record):
         """append a record to the statistics file, see cdbsfguide_stats.py"""
@@ -194,12 +243,266 @@ class SFGuide:
             self.stats.write(json.dumps(record) + "\n")
             self.stats.flush()
 
-    async def cdb_view(self, board, move):
-        """cdb's current best move at board, its score, and cdb's score for the given move"""
+    async def cdb_now(self, board):
+        """cdb's current scores at board, which queues it if cdb does not know it yet"""
         if self.measureDB is None:
             self.measureDB = self.chessdb(board)
         scored = await self.measureDB.queryall(board.epd(), board.chess960, skipTT=True)
-        moves = {m: s for m, s in scored.items() if m != "depth"}
+        return {m: s for m, s in scored.items() if m != "depth"}
+
+    async def propagate(self, board):
+        """query the positions from board back up to the root, each one after the one below it"""
+        b = board.copy()
+        while True:
+            await self.cdb_now(b)
+            if not b.move_stack:
+                break
+            b.pop()
+
+    async def short(self, board, move=None):
+        """a short search of the auxiliary threads of the position as cdb sees it: the engine's
+        line, possibly restricted to a move, and its score for the side to move"""
+        return await self.live.aux_line(board, self.args.leafNodes, move)
+
+    def final(self, board):
+        """whether there is nothing to fix at board: the game is over, or cdb knows it from tablebases"""
+        return (
+            board.is_game_over() or chess.popcount(board.occupied) <= cdbsearch.CDB_EGTB
+        )
+
+    def agree(self, cv, sv):
+        """whether cdb's score of a position agrees with the engine's, both for the side to move:
+        within --tol, or both decided for the same side, where the exact score does not matter
+        """
+        return (
+            abs(cv - sv) <= self.args.tol
+            or min(cv, sv) >= DECIDED
+            or max(cv, sv) <= -DECIDED
+        )
+
+    async def cdb_line(self, start):
+        """the positions of cdb's PV from start, to the leaf of its tree"""
+        if self.measureDB is None:
+            self.measureDB = self.chessdb(start)
+        line, b = [start.copy()], start.copy()
+        for m in self.live.to_moves(b, await self.measureDB.querypv(b.epd()) or []):
+            b.push(m)
+            line.append(b.copy())
+        return line
+
+    async def add_line(self, board, pv):
+        """add the positions of a line from board to cdb, and query them from the end of the line up
+        to the root, so that cdb updates its scores along it: returns the last position of the line
+        """
+        line, b = [], board.copy()
+        for m in pv:
+            if self.final(b):
+                break
+            b.push(m)
+            line.append(b.copy())
+        if not line:
+            return board
+        await asyncio.gather(*(self.cdb_now(p) for p in line))
+        await self.propagate(line[-1])
+        return line[-1]
+
+    async def fix(self, p, budget, indent, known=None):
+        """Bring cdb's value of p closer to the engine's, by adding the engine's lines from p to cdb:
+        its own line, and where cdb is too optimistic for the side to move and plays another move, its
+        refutation of that move. Then extend the lines from their ends with further short searches, as
+        long as that brings cdb's value closer. Returns whether cdb agrees in the end. When adding
+        lines twice in a row does not bring cdb closer, cdb's own evals of the positions on the lines
+        differ from the engine's, and more positions would not change that: then p is not tried again
+        until cdb's score of it changes."""
+        moves = await self.cdb_now(p)
+        if not moves:
+            return False
+        if known is None:
+            if budget[0] <= 0:
+                return False
+            budget[0] -= 1
+            known = await self.short(p)
+        pv, sv = known
+        if sv is None or not pv:
+            return False
+        best = max(moves, key=moves.get)
+        gap = moves[best] - sv
+        if self.agree(moves[best], sv):
+            self.agreed[p.epd()] = moves[best]
+            return True
+        w = 1 if p.turn == chess.WHITE else -1
+        bestMove = chess.Move.from_uci(best)
+        lines = [(p, pv)]
+        if gap > 0 and pv[0] != bestMove and budget[0] > 0:
+            budget[0] -= 1
+            refutation, _ = await self.short(p, bestMove)
+            if refutation:
+                lines.append((p, refutation))
+        print(
+            f"{indent}{p.fullmove_number}{'.' if p.turn else '...'} cdb {p.san(bestMove)} {w * moves[best]:+}, engine {p.san(pv[0])} {w * sv:+}: "
+            + (
+                "add the engine's line"
+                if len(lines) == 1
+                else f"add the engine's line, and its refutation of {p.san(bestMove)}"
+            ),
+            flush=True,
+        )
+        stalls = 0
+        while True:
+            ends = [await self.add_line(b, l) for b, l in lines]
+            moves = await self.cdb_now(p)
+            best = max(moves, key=moves.get)
+            newGap = moves[best] - sv
+            print(
+                f"{indent}  {sum(len(l) for _, l in lines)} plies added, cdb now {p.san(chess.Move.from_uci(best))} {w * moves[best]:+}",
+                flush=True,
+            )
+            if self.agree(moves[best], sv):
+                self.agreed[p.epd()] = moves[best]
+                return True
+            stalls = stalls + 1 if abs(newGap) > abs(gap) - self.args.tol / 2 else 0
+            gap = newGap
+            if stalls >= 2:
+                self.stalled[p.epd()] = moves[best]
+                return False
+            # extend the lines from their ends
+            lines = []
+            for e in ends:
+                if self.final(e) or budget[0] <= 0:
+                    continue
+                budget[0] -= 1
+                more, _ = await self.short(e)
+                if more:
+                    lines.append((e, more))
+            if not lines:
+                return False
+
+    async def repair(self, start, budget, indent):
+        """Repair cdb's line from start from the bottom up: follow it to the leaf of cdb's tree, check
+        its positions upward with short searches, which are reliable near the leaves, and fix the
+        deepest disagreement; then look at the line again, as cdb may now play another one. Positions
+        that agreed, or that could not be brought closer, are skipped until cdb's score of them changes,
+        so that each look reaches further up the line."""
+        fixes = 0
+        for attempt in range(self.args.repairs):
+            line = await self.cdb_line(start)
+            target, checked = None, 0
+            for p in reversed(line):
+                if checked >= self.args.scanPlies or budget[0] <= 0:
+                    break
+                if self.final(p):
+                    continue
+                moves = await self.cdb_now(p)
+                if not moves:
+                    continue
+                v = max(moves.values())
+                if v in (self.agreed.get(p.epd()), self.stalled.get(p.epd())):
+                    continue
+                checked += 1
+                budget[0] -= 1
+                found = await self.short(p)
+                if found[1] is None:
+                    continue
+                if not self.agree(v, found[1]):
+                    target = p
+                    break
+                self.agreed[p.epd()] = v
+            if target is None:
+                break
+            fixes += 1
+            await self.fix(target, budget, indent, found)
+        return fixes
+
+    async def refute(self, root):
+        """Walk the background search's PV to find where cdb ranks the moves differently from the
+        engine, then repair both competing lines at each such position from the bottom up, deepest
+        position first. Only short searches near the leaves decide: the engine's values far from the
+        leaves are not trusted, as they miss what only long lines show."""
+        pv = await self.live.ttpv(root, self.args.pvPlies)
+        board, found = root.copy(), []
+        for move in pv:
+            if self.final(board):
+                break
+            # deep in the PV, the moves come from shallow searches
+            node = await self.live.probe(board)
+            if node.get("hit") != "1" or int(node["depth"]) < self.args.minDepth:
+                break
+            moves = await self.cdb_now(board)
+            if not moves:
+                break
+            sf, best = board.uci(move), max(moves, key=moves.get)
+            cs = moves.get(sf)
+            if sf != best and (cs is None or moves[best] > cs + self.args.tol):
+                found.append((board.copy(), sf, best, cs, moves[best]))
+            board.push(move)
+        await self.propagate(board)
+        walked = len(board.move_stack) - len(root.move_stack)
+        print(
+            f"  the engine's PV, {walked} plies with TT entries of depth {self.args.minDepth} or more: {root.variation_san(pv[:12])} ...; cdb disagrees at {len(found)} positions",
+            flush=True,
+        )
+        self.log("pvwalk", plies=walked, disagreements=len(found))
+        # the largest disagreements first, among the positions repaired the fewest times so far
+        chosen = sorted(
+            found,
+            key=lambda t: (
+                self.repaired.get(t[0].epd(), 0),
+                t[3] - t[4] if t[3] is not None else -1000,
+            ),
+        )
+        for b, sf, best, cs, cb in sorted(
+            chosen[: self.args.maxMarks], key=lambda t: -len(t[0].move_stack)
+        ):
+            line = (
+                self.root.variation_san(b.move_stack[len(self.root.move_stack) :])
+                or "(root)"
+            )
+            w = 1 if b.turn == chess.WHITE else -1
+            print(
+                (
+                    f"  {line}: cdb {b.san(chess.Move.from_uci(best))} {w * cb:+} vs the engine's {b.san(chess.Move.from_uci(sf))} {w * cs:+}"
+                    if cs is not None
+                    else f"  {line}: cdb {b.san(chess.Move.from_uci(best))} {w * cb:+} vs the engine's {b.san(chess.Move.from_uci(sf))} (unscored)"
+                ),
+                flush=True,
+            )
+            self.repaired[b.epd()] = self.repaired.get(b.epd(), 0) + 1
+            fixes = searches = 0
+            for m in (best, sf):  # each line gets half of the budget
+                child, budget = b.copy(), [self.args.repairBudget // 2]
+                child.push_uci(m)
+                fixes += await self.repair(child, budget, "    ")
+                searches += self.args.repairBudget // 2 - budget[0]
+            await self.propagate(b)
+            after = await self.cdb_now(b)
+            newBest = max(after, key=after.get)
+            print(
+                f"    after {fixes} fixes and {searches} engine searches: cdb {b.san(chess.Move.from_uci(newBest))} {w * after[newBest]:+}, "
+                + (
+                    f"{b.san(chess.Move.from_uci(sf))} {w * after[sf]:+}"
+                    if sf in after
+                    else f"{b.san(chess.Move.from_uci(sf))} unscored"
+                ),
+                flush=True,
+            )
+            self.log(
+                "candidate",
+                line=line,
+                engineMove=sf,
+                cdbMove=best,
+                before={"best": best, "bestScore": cb, "engineMove": cs},
+                after={
+                    "best": newBest,
+                    "bestScore": after[newBest],
+                    "engineMove": after.get(sf),
+                },
+                fixes=fixes,
+                searches=searches,
+            )
+
+    async def cdb_view(self, board, move):
+        """cdb's current best move at board, its score, and cdb's score for the given move"""
+        moves = await self.cdb_now(board)
         if not moves:
             return {"best": None, "bestScore": None, "score": None}
         best = max(moves, key=lambda m: moves[m])
@@ -747,6 +1050,48 @@ async def run(args, root, guide, engine, live):
                 print(f"  background search: {live.status()}", flush=True)
                 last = datetime.now().timestamp()
         print(flush=True)
+    if args.refute:
+        await refute_rounds(args, root, guide, live, safely)
+    else:
+        await explore_rounds(args, root, guide, live, safely)
+
+    # give cdbsearch's background requests (reprobes and requeues) a chance to finish
+    pending = [
+        t
+        for t in asyncio.all_tasks()
+        if t is not asyncio.current_task() and not (args.live and t is live.reader)
+    ]
+    if pending:
+        await asyncio.wait(pending, timeout=120)
+    if args.live:
+        await live.request("stop", lambda l: l.startswith("bestmove"))
+        live.send("quit")
+        await live.proc.wait()
+    else:
+        await engine.quit()
+
+
+async def refute_rounds(args, root, guide, live, safely):
+    """walk the background search's PV, refuting what cdb overvalues, round after round"""
+    guide.root = root
+    live.send(f"auxthreads {args.auxThreads}")
+    rounds = 0
+    while args.rounds <= 0 or rounds < args.rounds:
+        rounds += 1
+        guide.round = rounds
+        print(
+            f"Round {rounds}, {datetime.now().isoformat()}, background search: {live.status()}",
+            flush=True,
+        )
+        await safely(guide.report, root)
+        guide.log("round", background=live.background(), root=await guide.cdb_now(root))
+        await safely(guide.refute, root)
+        guide.log("roundEnd", root=await guide.cdb_now(root))
+        print(flush=True)
+
+
+async def explore_rounds(args, root, guide, live, safely):
+    """walk and explore the targets, round after round"""
     walk = guide.live_walk if args.live else guide.pv_walk if args.pv else guide.walk
     await guide.report(root)
     targets = await walk(root)
@@ -774,21 +1119,6 @@ async def run(args, root, guide, engine, live):
         print(flush=True)
         await safely(guide.report, root)
         targets = await safely(guide.pv_check if args.pv else walk, root) or []
-
-    # give cdbsearch's background requests (reprobes and requeues) a chance to finish
-    pending = [
-        t
-        for t in asyncio.all_tasks()
-        if t is not asyncio.current_task() and not (args.live and t is live.reader)
-    ]
-    if pending:
-        await asyncio.wait(pending, timeout=120)
-    if args.live:
-        await live.request("stop", lambda l: l.startswith("bestmove"))
-        live.send("quit")
-        await live.proc.wait()
-    else:
-        await engine.quit()
 
 
 if __name__ == "__main__":
@@ -850,6 +1180,59 @@ if __name__ == "__main__":
         "--live",
         action="store_true",
         help="Keep one engine search running from the root, and compare cdb's choices with the TT of that search, probed while it runs. Needs the ttprobe and ttmoves commands of the cdb-tt branch of Stockfish.",
+    )
+    argParser.add_argument(
+        "--refute",
+        action="store_true",
+        help="With --live: walk the background search's PV to find where cdb ranks the moves differently, and repair both competing lines there from the bottom up, with short searches on the auxiliary threads near the leaves, instead of exploring targets with cdbsearch.",
+    )
+    argParser.add_argument(
+        "--pvPlies",
+        help="With --refute: the length of the background search's PV to walk.",
+        type=int,
+        default=100,
+    )
+    argParser.add_argument(
+        "--leafNodes",
+        help="With --refute: the nodes of the short searches near the leaves, which decide.",
+        type=int,
+        default=50000000,
+    )
+    argParser.add_argument(
+        "--scanPlies",
+        help="With --refute: check at most this many positions of a line from its leaf upward, at each look at it, besides those that agreed before.",
+        type=int,
+        default=20,
+    )
+    argParser.add_argument(
+        "--repairs",
+        help="With --refute: look at a line this many times, each time fixing its deepest disagreement.",
+        type=int,
+        default=3,
+    )
+    argParser.add_argument(
+        "--repairBudget",
+        help="With --refute: the short searches available for repairing the two lines at a position where cdb and the engine disagree.",
+        type=int,
+        default=60,
+    )
+    argParser.add_argument(
+        "--tol",
+        help="With --refute: the margin in cp of a disagreement between cdb and the engine.",
+        type=int,
+        default=15,
+    )
+    argParser.add_argument(
+        "--maxMarks",
+        help="With --refute: repair at most this many of the positions where cdb and the engine disagree, per round.",
+        type=int,
+        default=6,
+    )
+    argParser.add_argument(
+        "--auxThreads",
+        help="With --refute: the number of threads of the auxiliary searches.",
+        type=int,
+        default=3,
     )
     argParser.add_argument(
         "--prefillNodes",
@@ -964,6 +1347,8 @@ if __name__ == "__main__":
         help="Argument passed to cdbsearch.",
     )
     args = argParser.parse_args()
+    if args.refute and not args.live:
+        argParser.error("--refute needs --live")
 
     if args.san is not None:
         game = chess.pgn.read_game(StringIO(args.san))

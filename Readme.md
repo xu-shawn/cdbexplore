@@ -174,7 +174,7 @@ python cdbexplore/cdbbulksearch.py book.pgn --forever >& cdbsearch_book.log &
 This is a command line program that uses Stockfish (or any UCI engine) to find the positions where cdb's main lines are likely wrong, and lets `cdbsearch` explore those positions.
 After each exploration, the line is queried once more from its leaf back to its root, so that cdb's scores along it get updated.
 
-It has three modes:
+It has four modes:
 
 * By default, it walks cdb's main line from the root, and asks the engine at every position whether it would play another move.
   Where the engine prefers its own move by at least `--threshold` cp, the position after the engine's move becomes a target, and the walk follows the engine's line as well.
@@ -189,24 +189,39 @@ It has three modes:
   With `--scoreGap`, both moves are first scored by auxiliary searches, and only gaps of at least `--threshold` cp are explored.
   With `--rounds 0`, walking and exploring go on until stopped, and a target that is found again is explored one depth deeper.
   This needs the `ttprobe`, `ttmoves` and `aux*` commands of the [`cdb-tt`](https://github.com/xu-shawn/Stockfish/tree/cdb-tt) branch of Stockfish.
+* With `--live --refute`, it fixes cdb's evals from the bottom up itself, with short searches near the leaves, instead of letting `cdbsearch` explore.
+  It walks the PV of the background search (`--pvPlies`), as far as its TT entries have a depth of at least `--minDepth`, and flags the positions where cdb scores its own best move more than `--tol` cp above the engine's move: comparing cdb's scores of the two moves, rather than cdb's score with the engine's, avoids the different scales.
+  At up to `--maxMarks` of them per round, deepest first and the least often repaired first, it repairs both lines, the one after cdb's move and the one after the engine's move.
+  To repair a line, it follows cdb's PV to the leaf of cdb's tree, and checks its positions upward with short searches (`--leafNodes`) on the auxiliary threads (`--auxThreads`), of the positions as cdb sees them, without the moves that led to them.
+  At the deepest position where cdb's value differs from the engine's by more than `--tol` cp, unless both see the same side 400 cp or more ahead, it adds the engine's line to cdb, and if cdb is too optimistic for the side to move and plays another move, the engine's refutation of that move; it queries the lines from their ends back up to the root, and extends them from their ends with further short searches, as long as that brings cdb's value closer to the engine's.
+  When two additions in a row do not, cdb's own evals of the positions on these lines differ from the engine's, and more positions would not change that.
+  Positions that agree, or that could not be brought closer, are skipped until cdb's score of them changes, so that every new look at the line (`--repairs`) reaches further up, while its share of the `--repairBudget` searches lasts.
+  The engine's values far from the leaves never decide: they miss what only long lines show, and underestimate advantages that only show deep in the endgame.
+  Adding positions to cdb does not make its minimax worse, so where a short search is wrong, cdb's own scores of the added positions settle it.
 
 In each round, the targets that are explored (`--maxTargets`) are explored deepest first, and every exploration ends by querying its line from the leaf back to the root.
 As cdb updates the scores of a position when it is queried, this fixes cdb's evals from the bottom up.
 
 To measure the effect of a run, `--stats FILE` appends statistics to `FILE` (JSON lines): at every walk, cdb's scores of the root moves and how often cdb agrees with the engine; for every exploration, cdb's best move and its score of the engine's move, before and after.
+With `--refute`: at every round, cdb's scores of the root moves; for every repaired position, cdb's best move and its scores of that move and the engine's move, before and after, and the number of short searches.
 The disagreements of the first walk serve as a fixed set: every walk records whether cdb now plays the engine's move there.
 With `--holdout`, a random part of them (at least `--holdoutPly` plies from the root) is never explored, nor are the lines below them, as a control group: comparing the explored disagreements with the held out ones tells the effect of the run from cdb's own drift.
 `cdbsfguide_stats.py FILE --plot FILE.png` summarises such a file.
 
-Example of a run without end, with a control group, for the start position in which only White may castle:
+Example of a run without end that repairs lines itself, for the start position in which only White may castle:
+```shell
+python cdbsfguide.py --live --refute --epd "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQ - 0 1" --engine Stockfish/src/stockfish --threads 5 --hash 32768 --auxThreads 3 --rounds 0 --stats kq.jsonl >& kq.log &
+```
+
+Example of a run without end that explores with `cdbsearch`, with a control group:
 ```shell
 python cdbsfguide.py --live --epd "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQ - 0 1" --engine Stockfish/src/stockfish --threads 5 --hash 32768 --minDepth 30 --exploreDepth 6 --rounds 0 --holdout 0.3 --stats kq.jsonl >& kq.log &
 python cdbsfguide_stats.py kq.jsonl --plot kq.png
 ```
 
 ```
-usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--live] [--prefillNodes PREFILLNODES] [--minDepth MINDEPTH] [--auxNodes AUXNODES] [--scoreGap] [--threshold THRESHOLD] [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--stats STATS] [--holdout HOLDOUT]
-                     [--holdoutPly HOLDOUTPLY] [--seed SEED] [--concurrency CONCURRENCY] [--evalDecay EVALDECAY] [--user USER] [--suppressErrors]
+usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--live] [--refute] [--pvPlies PVPLIES] [--leafNodes LEAFNODES] [--scanPlies SCANPLIES] [--repairs REPAIRS] [--repairBudget REPAIRBUDGET] [--tol TOL] [--maxMarks MAXMARKS] [--auxThreads AUXTHREADS] [--prefillNodes PREFILLNODES] [--minDepth MINDEPTH] [--auxNodes AUXNODES] [--scoreGap] [--threshold THRESHOLD]
+                     [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--stats STATS] [--holdout HOLDOUT] [--holdoutPly HOLDOUTPLY] [--seed SEED] [--concurrency CONCURRENCY] [--evalDecay EVALDECAY] [--user USER] [--suppressErrors]
 
 Use Stockfish to find the positions where cdb's main lines are likely wrong, and explore those with cdbsearch.
 
@@ -223,6 +238,19 @@ options:
   --maxSearches MAXSEARCHES
                         With --pv: the number of engine searches. The first one is from the root, the others refute cdb's choices wherever they differ from the engine's main lines, closest to the root first. (default: 3)
   --live                Keep one engine search running from the root, and compare cdb's choices with the TT of that search, probed while it runs. Needs the ttprobe and ttmoves commands of the cdb-tt branch of Stockfish. (default: False)
+  --refute              With --live: walk the background search's PV to find where cdb ranks the moves differently, and repair both competing lines there from the bottom up, with short searches on the auxiliary threads near the leaves, instead of exploring targets with cdbsearch. (default: False)
+  --pvPlies PVPLIES     With --refute: the length of the background search's PV to walk. (default: 100)
+  --leafNodes LEAFNODES
+                        With --refute: the nodes of the short searches near the leaves, which decide. (default: 50000000)
+  --scanPlies SCANPLIES
+                        With --refute: check at most this many positions of a line from its leaf upward, at each look at it, besides those that agreed before. (default: 20)
+  --repairs REPAIRS     With --refute: look at a line this many times, each time fixing its deepest disagreement. (default: 3)
+  --repairBudget REPAIRBUDGET
+                        With --refute: the short searches available for repairing the two lines at a position where cdb and the engine disagree. (default: 60)
+  --tol TOL             With --refute: the margin in cp of a disagreement between cdb and the engine. (default: 15)
+  --maxMarks MAXMARKS   With --refute: repair at most this many of the positions where cdb and the engine disagree, per round. (default: 6)
+  --auxThreads AUXTHREADS
+                        With --refute: the number of threads of the auxiliary searches. (default: 3)
   --prefillNodes PREFILLNODES
                         With --live: the number of nodes the background search makes before the first walk. (default: 1000000000)
   --minDepth MINDEPTH   With --live: only trust TT entries of at least this depth. (default: 25)
@@ -241,7 +269,7 @@ options:
                         Explore at most this many targets per round: the ones with the largest gap (with --pv and --live: closest to the root). They are explored deepest first, so that cdb's evals get fixed from the bottom up. (default: 8)
   --rounds ROUNDS       Number of rounds of exploring the targets, each followed by a new walk (with --pv: by comparing cdb with the earlier engine lines again). With 0, keep going until stopped. A target found again is explored one depth deeper. (default: 1)
   --stats STATS         Append statistics of the walks and explorations to this file (JSON lines), see cdbsfguide_stats.py. (default: None)
-  --holdout HOLDOUT     With --live: the fraction of the first walk's disagreements that is never explored, as a control group for --stats. (default: 0.0)
+  --holdout HOLDOUT     With --live: the fraction of the first walk's disagreements without other ones below them (leaves) that is never explored, as a control group for --stats. (default: 0.0)
   --holdoutPly HOLDOUTPLY
                         With --holdout: only disagreements at least this many plies from the root are held out. Positions below them are not explored either. (default: 4)
   --seed SEED           Seed for choosing the held out disagreements. (default: 1)
