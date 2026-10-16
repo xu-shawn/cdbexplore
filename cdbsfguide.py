@@ -47,10 +47,6 @@ def parse_tt(line):
 DECIDED = 400
 
 
-# beyond any score of cdb, for comparisons with missing scores
-CDB_NONE = 100000
-
-
 class LiveEngine:
     """a UCI engine with a search running in the background, whose TT we probe meanwhile: this
     needs the ttprobe and ttmoves commands of the cdb-tt branch of Stockfish"""
@@ -288,6 +284,7 @@ class SFGuide:
         # where cdb agreed with the engine, or could not be brought closer, with cdb's score then
         self.repaired, self.agreed, self.stalled = {}, {}, {}
         self.searched = {}  # the short searches, by position
+        self.diving, self.divesLeft = False, 0  # see dive()
 
     def log(self, event, **record):
         """append a record to the statistics file, see cdbsfguide_stats.py"""
@@ -460,6 +457,8 @@ class SFGuide:
                 stalls = 0
             gap = newGap
             if stalls >= 2:
+                if await self.dive(p, m, sv, indent + "  "):
+                    return True
                 self.stalled[p.epd()] = cm
                 return False
             # extend the lines from their ends
@@ -507,7 +506,7 @@ class SFGuide:
                 break
         return fixes
 
-    async def refute(self, root, dives=0):
+    async def refute(self, root, line=None, marks=None, budget=None, indent=""):
         """Prove the engine's line to cdb, for the side to move at the root. Walk the PV of the
         background search as far as its TT entries are deep, and add its positions to cdb. At the
         opponent's positions on it, every move that cdb scores better for the opponent than the
@@ -515,18 +514,22 @@ class SFGuide:
         lines after those, from the bottom up, and the end of the engine's line too. Where cdb
         scores another move of our side above the engine's, nothing needs doing: our line only has
         to be proven good, and a move cdb wrongly prefers to it does not lower cdb's score of it.
-        Then dive into up to the given number of defences that cdb still prefers to the engine's
-        move, see dive().
+        In a dive (see dive()) the engine's line is that of a longer search on the auxiliary threads,
+        from the position of the dive, which then plays the part of the root.
         """
-        pv = await self.live.ttpv(root, self.args.pvPlies)
+        marks = marks or self.args.maxMarks
+        budgetPerLine = budget or self.args.repairBudget
+        dive, pv = line is not None, line or await self.live.ttpv(
+            root, self.args.pvPlies
+        )
         board, line = root.copy(), []
         for move in pv:
             if self.final(board):
                 break
-            # deep in the PV, the moves come from shallow searches
-            node = await self.live.probe(board)
-            if node.get("hit") != "1" or int(node["depth"]) < self.args.minDepth:
-                break
+            if not dive:  # deep in the PV, the moves come from shallow searches
+                node = await self.live.probe(board)
+                if node.get("hit") != "1" or int(node["depth"]) < self.args.minDepth:
+                    break
             line.append((board.copy(), move))
             board.push(move)
         # add the line to cdb, and let cdb update its scores along it
@@ -546,21 +549,27 @@ class SFGuide:
             for a, score in moves.items():
                 if a != b.uci(m) and score > ours + self.args.margin:
                     found.append((b, m, chess.Move.from_uci(a), score - ours))
+        what = "the dive's line" if dive else "the engine's line"
+        depths = (
+            "" if dive else f" with TT entries of depth {self.args.minDepth} or more"
+        )
         print(
-            f"  the engine's line, {len(line)} plies with TT entries of depth {self.args.minDepth} or more: {root.variation_san(pv[: min(len(line), 16)])} ...;"
+            f"{indent}  {what}, {len(line)} plies{depths}: {root.variation_san(pv[: min(len(line), 16)])} ...;"
             f" cdb sees {len(found)} better defences against it",
             flush=True,
         )
-        self.log("pvwalk", plies=len(line), disagreements=len(found))
+        if not dive:
+            self.log("pvwalk", plies=len(line), disagreements=len(found))
 
         # the end of the engine's line
-        budget = [self.args.repairBudget]
-        fixes = await self.repair(board, budget, "    ")
+        budget = [budgetPerLine]
+        fixes = await self.repair(board, budget, indent + "    ")
         print(
-            f"  the end of the line: {fixes} fixes, {self.args.repairBudget - budget[0]} engine searches",
+            f"{indent}  the end of the line: {fixes} fixes, {budgetPerLine - budget[0]} engine searches",
             flush=True,
         )
-        self.log("lineEnd", fixes=fixes, searches=self.args.repairBudget - budget[0])
+        if not dive:
+            self.log("lineEnd", fixes=fixes, searches=budgetPerLine - budget[0])
 
         # among the defences repaired the fewest times so far, those closest to the root first, as
         # the shallowest defence on cdb's path caps its score of the line, then the largest gaps;
@@ -570,10 +579,7 @@ class SFGuide:
             found,
             key=lambda t: (self.repaired.get(key(t), 0), len(t[0].move_stack), -t[3]),
         )
-        difficult = []
-        for b, m, a, gap in sorted(
-            chosen[: self.args.maxMarks], key=lambda t: -len(t[0].move_stack)
-        ):
+        for b, m, a, gap in sorted(chosen[:marks], key=lambda t: -len(t[0].move_stack)):
             at = (
                 self.root.variation_san(b.move_stack[len(self.root.move_stack) :])
                 or "(root)"
@@ -581,23 +587,25 @@ class SFGuide:
             w = 1 if b.turn == chess.WHITE else -1
             before = await self.cdb_now(b)
             print(
-                f"  {at}: cdb {b.san(a)} {w * before[a.uci()]:+} vs the engine's {b.san(m)} {w * before[m.uci()]:+}",
+                f"{indent}  {at}: cdb {b.san(a)} {w * before[a.uci()]:+} vs the engine's {b.san(m)} {w * before[m.uci()]:+}",
                 flush=True,
             )
             self.repaired[key((b, m, a))] = self.repaired.get(key((b, m, a)), 0) + 1
-            child, budget = b.copy(), [self.args.repairBudget]
+            child, budget = b.copy(), [budgetPerLine]
             child.push(a)
-            fixes = await self.repair(child, budget, "    ")
+            fixes = await self.repair(child, budget, indent + "    ")
             await self.propagate(b)
             after = await self.cdb_now(b)
             print(
                 (
-                    f"    after {fixes} fixes and {self.args.repairBudget - budget[0]} engine searches: cdb {b.san(a)} {w * after[a.uci()]:+}, {b.san(m)} {w * after[m.uci()]:+}"
+                    f"{indent}    after {fixes} fixes and {budgetPerLine - budget[0]} engine searches: cdb {b.san(a)} {w * after[a.uci()]:+}, {b.san(m)} {w * after[m.uci()]:+}"
                     if a.uci() in after and m.uci() in after
-                    else f"    after {fixes} fixes and {self.args.repairBudget - budget[0]} engine searches"
+                    else f"{indent}    after {fixes} fixes and {budgetPerLine - budget[0]} engine searches"
                 ),
                 flush=True,
             )
+            if dive:
+                continue
             self.log(
                 "defence",
                 line=at,
@@ -609,47 +617,52 @@ class SFGuide:
                 },
                 after={"defence": after.get(a.uci()), "engineMove": after.get(m.uci())},
                 fixes=fixes,
-                searches=self.args.repairBudget - budget[0],
+                searches=budgetPerLine - budget[0],
             )
-            if (
-                after.get(a.uci(), -CDB_NONE)
-                > after.get(m.uci(), CDB_NONE) + self.args.margin
-            ):
-                difficult.append((b, a))
 
-        # the defences closest to the root cap cdb's score of the line most
-        for b, a in sorted(difficult, key=lambda t: len(t[0].move_stack))[:dives]:
-            child = b.copy()
-            child.push(a)
-            await self.dive(child)
-
-    async def dive(self, board):
-        """At a defence that cdb still prefers to the engine's move after its repair, search from
-        the position after it for a while (--diveNodes), and prove the engine's line from there, as
-        from the root, but without diving further. Then search from the root again, as long.
-        """
-        at = self.root.variation_san(board.move_stack[len(self.root.move_stack) :])
-        print(f"  diving into {at}", flush=True)
-        await self.live.search(board)
-        await self.live.wait_nodes(self.args.diveNodes)
-        print(f"  dive, background search: {self.live.status()}", flush=True)
-        before = await self.cdb_now(board)
-        await self.refute(board)
-        await self.propagate(board)
-        after = await self.cdb_now(board)
-        w = 1 if board.turn == chess.WHITE else -1
-        print(
-            f"  the dive is over: cdb's score after {at} was {w * max(before.values()):+}, now {w * max(after.values()):+}",
-            flush=True,
-        )
-        self.log(
-            "dive",
-            line=at,
-            before=max(before.values()) if before else None,
-            after=max(after.values()) if after else None,
-        )
-        await self.live.search(self.root)
-        await self.live.wait_nodes(self.args.diveNodes)
+    async def dive(self, p, m, sv, indent):
+        """At a position where adding the engine's lines does not bring cdb's score of our move m
+        closer to the engine's, go down that line for a while: search the position longer on the
+        auxiliary threads (--diveNodes), and prove the engine's line from there as from the root,
+        then look at the position again, with the longer search's score. Dives do not nest, and
+        there are at most --dives of them per round. Returns whether cdb agrees then."""
+        if self.diving or self.divesLeft <= 0:
+            return False
+        self.divesLeft -= 1
+        self.diving = True
+        try:
+            at = self.root.variation_san(p.move_stack[len(self.root.move_stack) :])
+            w = 1 if p.turn == chess.WHITE else -1
+            print(f"{indent}diving into {at or '(root)'}", flush=True)
+            pv, score = await self.live.aux_line(p, self.args.diveNodes)
+            if not pv or score is None:
+                return False
+            self.searched[p.epd()] = (
+                pv,
+                score,
+            )  # the proof lines through p now take this move
+            before = (await self.cdb_now(p)).get(pv[0].uci())
+            await self.refute(
+                p, pv, self.args.diveMarks, self.args.repairBudget // 2, indent
+            )
+            await self.propagate(p)
+            after = (await self.cdb_now(p)).get(pv[0].uci())
+            print(
+                f"{indent}the dive is over: {p.san(pv[0])}: cdb {f'{w * before:+}' if before is not None else 'unscored'} -> {f'{w * after:+}' if after is not None else 'unscored'},"
+                f" the dive's search {w * score:+} (the short one {w * sv:+} for {p.san(m)})",
+                flush=True,
+            )
+            self.log(
+                "dive",
+                line=at,
+                move=pv[0].uci(),
+                score=score,
+                before=before,
+                after=after,
+            )
+            return after is not None and self.agree(after, score)
+        finally:
+            self.diving = False
 
     async def cdb_view(self, board, move):
         """cdb's current best move at board, its score, and cdb's score for the given move"""
@@ -1241,7 +1254,8 @@ async def refute_rounds(args, root, guide, live, safely):
         )
         await safely(guide.report, root)
         guide.log("round", background=live.background(), root=await guide.cdb_now(root))
-        await safely(guide.refute, root, args.dives)
+        guide.divesLeft = args.dives
+        await safely(guide.refute, root)
         guide.log("roundEnd", root=await guide.cdb_now(root))
         print(flush=True)
 
@@ -1386,15 +1400,21 @@ if __name__ == "__main__":
     )
     argParser.add_argument(
         "--dives",
-        help="With --refute: after each round, dive into this many of the defences that cdb still prefers to the engine's move: search from the position after the defence for --diveNodes nodes and prove the engine's line from there, then search from the root again.",
+        help="With --refute: per round, at most this many positions where adding the engine's lines does not bring cdb closer get a dive: a longer search there on the auxiliary threads, and a proof of its line from there as from the root.",
         type=int,
-        default=1,
+        default=2,
     )
     argParser.add_argument(
         "--diveNodes",
-        help="With --dives: the nodes of the background search from a dive's position before proving the engine's line from there, and from the root again after it.",
+        help="With --dives: the nodes of the longer search of a dive.",
         type=int,
-        default=2000000000,
+        default=500000000,
+    )
+    argParser.add_argument(
+        "--diveMarks",
+        help="With --dives: repair at most this many defences against the line of a dive, each with half of --repairBudget.",
+        type=int,
+        default=3,
     )
     argParser.add_argument(
         "--maxMarks",
