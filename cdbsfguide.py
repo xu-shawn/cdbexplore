@@ -1,4 +1,4 @@
-import argparse, asyncio, contextlib, json, random, time
+import argparse, asyncio, contextlib, contextvars, functools, json, random, time
 import chess, chess.engine, chess.pgn
 import cdbsearch
 from io import StringIO
@@ -47,6 +47,27 @@ def parse_tt(line):
 DECIDED = 400
 
 
+def alone(f):
+    """run a method of LiveEngine alone, as the engine answers one request at a time"""
+
+    @functools.wraps(f)
+    async def run(self, *args, **kwargs):
+        async with self.lock:
+            start = time.monotonic()
+            try:
+                return await f(self, *args, **kwargs)
+            finally:
+                self.busy += time.monotonic() - start
+
+    return run
+
+
+# where the output of a part of the work that runs alongside others goes, see SFGuide.say()
+OUTPUT = contextvars.ContextVar("output", default=None)
+# whether the work is in a dive, see SFGuide.dive()
+DIVING = contextvars.ContextVar("diving", default=False)
+
+
 class LiveEngine:
     """a UCI engine with a search running in the background, whose TT we probe meanwhile: this
     needs the ttprobe and ttmoves commands of the cdb-tt branch of Stockfish"""
@@ -54,6 +75,7 @@ class LiveEngine:
     async def start(self, path, options):
         """start the engine"""
         self.info, self.auxInfo, self.name, self.nodesSeen = "", "", path, 0
+        self.lock, self.busy = asyncio.Lock(), 0.0
         self.replies = asyncio.Queue()
         self.attached, self.searchPosition = False, None
         self.proc = await asyncio.create_subprocess_exec(
@@ -70,6 +92,7 @@ class LiveEngine:
     async def attach(self, socket, options):
         """use the engine of a uciserver.py listening on the socket: its search may be running"""
         self.info, self.auxInfo, self.nodesSeen = "", "", 0
+        self.lock, self.busy = asyncio.Lock(), 0.0
         self.replies = asyncio.Queue()
         self.stdout, self.stdin = await asyncio.open_unix_connection(
             socket, limit=2**20
@@ -85,6 +108,7 @@ class LiveEngine:
         else:  # also reads the latest info lines of the search, which the server sends first
             await self.request("isready", lambda l: l == "readyok")
 
+    @alone
     async def search(self, board):
         """start the background search from board, stopping the one running: the TT stays"""
         if self.searchPosition is not None:
@@ -192,6 +216,7 @@ class LiveEngine:
         """set the engine's position to the one on board, with the moves leading to it"""
         self.send(self.position_command(board))
 
+    @alone
     async def aux_search(self, board, nodes, move=None):
         """a search of the auxiliary thread, which shares the TT with the background search:
         returns its best move and score for the side to move, possibly restricted to a move
@@ -225,6 +250,7 @@ class LiveEngine:
             b.push(m)
         return moves
 
+    @alone
     async def aux_line(self, board, nodes, move=None):
         """a search of the auxiliary threads of the position on board without the moves that led to
         it, as cdb sees it: its PV, possibly restricted to a move, and its score for the side to move
@@ -242,12 +268,14 @@ class LiveEngine:
         pv = self.to_moves(board, t[t.index("pv") + 1 :])
         return pv, tt_score(t[i + 1], int(t[i + 2]))
 
+    @alone
     async def ttpv(self, board, plies):
         """the PV formed by the TT moves from board"""
         self.position(board)
         line = (await self.request(f"ttpv {plies}", lambda l: l.startswith("ttpv")))[-1]
         return self.to_moves(board, line.split()[1:])
 
+    @alone
     async def probe(self, board):
         """the TT entry of the position on board"""
         self.position(board)
@@ -255,6 +283,7 @@ class LiveEngine:
             (await self.request("ttprobe", lambda l: l.startswith("ttprobe")))[-1]
         )
 
+    @alone
     async def tt(self, board):
         """the TT entry of the position on board, and those of the positions after its legal moves"""
         self.position(board)
@@ -284,7 +313,8 @@ class SFGuide:
         # where cdb agreed with the engine, or could not be brought closer, with cdb's score then
         self.repaired, self.agreed, self.stalled = {}, {}, {}
         self.searched = {}  # the short searches, by position
-        self.diving, self.divesLeft = False, 0  # see dive()
+        self.divesLeft = 0  # see dive()
+        self.cdbWait, self.cdbQueries = 0.0, 0  # for the statistics
 
     def log(self, event, **record):
         """append a record to the statistics file, see cdbsfguide_stats.py"""
@@ -302,17 +332,41 @@ class SFGuide:
         """cdb's current scores at board, which queues it if cdb does not know it yet"""
         if self.measureDB is None:
             self.measureDB = self.chessdb(board)
+        start = time.monotonic()
         scored = await self.measureDB.queryall(board.epd(), board.chess960, skipTT=True)
+        self.cdbWait += time.monotonic() - start
+        self.cdbQueries += 1
         return {m: s for m, s in scored.items() if m != "depth"}
 
-    async def propagate(self, board):
-        """query the positions from board back up to the root, each one after the one below it"""
+    async def propagate(self, board, upTo=None):
+        """query the positions from board back up to the root, or to the position upTo, each one
+        after the one below it, so that cdb updates its scores along the way"""
         b = board.copy()
+        stop = len(upTo.move_stack) if upTo is not None else 0
         while True:
             await self.cdb_now(b)
-            if not b.move_stack:
+            if len(b.move_stack) <= stop:
                 break
             b.pop()
+
+    def say(self, text="", flush=True):
+        """print, or keep the text for the block of output of the work it belongs to"""
+        out = OUTPUT.get()
+        if out is None:
+            print(text, flush=True)
+        else:
+            out.append(text)
+
+    async def apart(self, work):
+        """do some work alongside other work, with its output printed in one block at its end"""
+        out = []
+        OUTPUT.set(out)  # in the context of this task only
+        try:
+            return await work()
+        finally:
+            OUTPUT.set(None)
+            for text in out:
+                self.say(text)
 
     async def short(self, board, move=None):
         """a short search of the auxiliary threads of the position as cdb sees it: the engine's
@@ -394,10 +448,10 @@ class SFGuide:
             b.push(m)
         return line, b
 
-    async def add_line(self, board, pv):
+    async def add_line(self, board, pv, upTo=None):
         """add the positions of a line from board to cdb, and query them from the end of the line up
-        to the root, so that cdb updates its scores along it: returns the last position of the line
-        """
+        to the root, or to the position upTo, so that cdb updates its scores along it: returns the
+        last position of the line"""
         line, b = [], board.copy()
         for m in pv:
             if self.final(b):
@@ -407,7 +461,7 @@ class SFGuide:
         if not line:
             return board
         await asyncio.gather(*(self.cdb_now(p) for p in line))
-        await self.propagate(line[-1])
+        await self.propagate(line[-1], upTo)
         return line[-1]
 
     async def fix(self, p, m, view, budget, indent, goal=None):
@@ -436,22 +490,20 @@ class SFGuide:
                 refutation, _ = await self.short(child, defence)
                 if refutation:
                     lines.append((child, refutation))
-        print(
+        self.say(
             f"{indent}{p.fullmove_number}{'.' if p.turn else '...'} {p.san(m)}: cdb {f'{w * cm:+}' if cm is not None else 'unscored'}, engine {w * sv:+}: "
             + (
                 "add the engine's line"
                 if len(lines) == 1
                 else f"add the engine's line, and its refutation of {child.san(defence)}"
             ),
-            flush=True,
         )
         gap, stalls = cm - sv if cm is not None else None, 0
         while True:
-            ends = [await self.add_line(b, l) for b, l in lines]
+            ends = [await self.add_line(b, l, p) for b, l in lines]
             cm = (await self.cdb_now(p)).get(m.uci())
-            print(
+            self.say(
                 f"{indent}  {sum(len(l) for _, l in lines)} plies added, cdb now {f'{w * cm:+}' if cm is not None else 'unscored'}",
-                flush=True,
             )
             if cm is None:
                 return False
@@ -492,11 +544,11 @@ class SFGuide:
         fixes = 0
         for attempt in range(self.args.repairs):
             line, _ = await self.proof_line(start, budget)
+            line = [t for t in line if t[2] is not None and t[2][1] is not None]  # ours
+            scores = await asyncio.gather(*(self.cdb_now(p) for p, _, _ in line))
             target = None
-            for p, m, view in reversed(line):
-                if view is None or view[1] is None:
-                    continue  # the opponent's move
-                cm = (await self.cdb_now(p)).get(m.uci())
+            for (p, m, view), moves in reversed(list(zip(line, scores))):
+                cm = moves.get(m.uci())
                 if cm is not None and cm in (
                     self.agreed.get(p.epd()),
                     self.stalled.get(p.epd()),
@@ -513,6 +565,7 @@ class SFGuide:
                 break
             fixes += 1
             await self.fix(*target, budget, indent, goal)
+            await self.propagate(target[0], start)
             if budget[0] <= 0:
                 break
         return fixes
@@ -561,10 +614,9 @@ class SFGuide:
             goal = max(known) if known else None
 
         found = []  # the defences: position, the engine's move, the defence, its gap
-        for b, m in line:
-            if b.turn == self.root.turn:
-                continue
-            moves = await self.cdb_now(b)
+        theirs = [(b, m) for b, m in line if b.turn != self.root.turn]
+        scores = await asyncio.gather(*(self.cdb_now(b) for b, _ in theirs))
+        for (b, m), moves in zip(theirs, scores):
             ours = moves.get(b.uci(m))
             if ours is None:
                 continue
@@ -582,43 +634,32 @@ class SFGuide:
             "" if dive else f" with TT entries of depth {self.args.minDepth} or more"
         )
         wr = 1 if root.turn == chess.WHITE else -1
-        print(
+        self.say(
             f"{indent}  {what}, {len(line)} plies{depths}: {root.variation_san(pv[: min(len(line), 16)])} ...;"
             f" cdb sees {len(found)} better defences against it"
             + (f", with the goal {wr * goal:+}" if goal is not None else ""),
-            flush=True,
         )
         if not dive:
             self.log("pvwalk", plies=len(line), disagreements=len(found))
 
-        # the end of the engine's line
-        budget = [budgetPerLine]
-        fixes = await self.repair(board, budget, indent + "    ", goal)
-        print(
-            f"{indent}  the end of the line: {fixes} fixes, {budgetPerLine - budget[0]} engine searches",
-            flush=True,
-        )
-        if not dive:
-            self.log("lineEnd", fixes=fixes, searches=budgetPerLine - budget[0])
+        async def line_end():
+            budget = [budgetPerLine]
+            fixes = await self.repair(board, budget, indent + "    ", goal)
+            self.say(
+                f"{indent}  the end of the line: {fixes} fixes, {budgetPerLine - budget[0]} engine searches"
+            )
+            if not dive:
+                self.log("lineEnd", fixes=fixes, searches=budgetPerLine - budget[0])
 
-        # among the defences repaired the fewest times so far, those closest to the root first, as
-        # the shallowest defence on cdb's path caps its score of the line, then the largest gaps;
-        # each round repairs them deepest first
-        key = lambda t: (t[0].epd(), t[2].uci())
-        chosen = sorted(
-            found,
-            key=lambda t: (self.repaired.get(key(t), 0), len(t[0].move_stack), -t[3]),
-        )
-        for b, m, a, gap in sorted(chosen[:marks], key=lambda t: -len(t[0].move_stack)):
+        async def defend(b, m, a):
             at = (
                 self.root.variation_san(b.move_stack[len(self.root.move_stack) :])
                 or "(root)"
             )
             w = 1 if b.turn == chess.WHITE else -1
             before = await self.cdb_now(b)
-            print(
-                f"{indent}  {at}: cdb {b.san(a)} {w * before[a.uci()]:+} vs the engine's {b.san(m)} {w * before[m.uci()]:+}",
-                flush=True,
+            self.say(
+                f"{indent}  {at}: cdb {b.san(a)} {w * before[a.uci()]:+} vs the engine's {b.san(m)} {w * before[m.uci()]:+}"
             )
             self.repaired[key((b, m, a))] = self.repaired.get(key((b, m, a)), 0) + 1
             child, budget = b.copy(), [budgetPerLine]
@@ -629,16 +670,13 @@ class SFGuide:
             fixes = await self.repair(child, budget, indent + "    ", need)
             await self.propagate(b)
             after = await self.cdb_now(b)
-            print(
-                (
-                    f"{indent}    after {fixes} fixes and {budgetPerLine - budget[0]} engine searches: cdb {b.san(a)} {w * after[a.uci()]:+}, {b.san(m)} {w * after[m.uci()]:+}"
-                    if a.uci() in after and m.uci() in after
-                    else f"{indent}    after {fixes} fixes and {budgetPerLine - budget[0]} engine searches"
-                ),
-                flush=True,
+            self.say(
+                f"{indent}    after {fixes} fixes and {budgetPerLine - budget[0]} engine searches: cdb {b.san(a)} {w * after[a.uci()]:+}, {b.san(m)} {w * after[m.uci()]:+}"
+                if a.uci() in after and m.uci() in after
+                else f"{indent}    after {fixes} fixes and {budgetPerLine - budget[0]} engine searches"
             )
             if dive:
-                continue
+                return
             self.log(
                 "defence",
                 line=at,
@@ -653,20 +691,47 @@ class SFGuide:
                 searches=budgetPerLine - budget[0],
             )
 
+        # among the defences repaired the fewest times so far, those closest to the root first, as
+        # the shallowest defence on cdb's path caps its score of the line, then the largest gaps;
+        # they are repaired deepest first, alongside each other and the end of the line, as their
+        # lines do not meet: cdb's answers take long, while the short searches wait their turn
+        key = lambda t: (t[0].epd(), t[2].uci())
+        chosen = sorted(
+            found,
+            key=lambda t: (self.repaired.get(key(t), 0), len(t[0].move_stack), -t[3]),
+        )
+        work = [line_end] + [
+            functools.partial(defend, b, m, a)
+            for b, m, a, _ in sorted(
+                chosen[:marks], key=lambda t: -len(t[0].move_stack)
+            )
+        ]
+        if dive:  # a dive works within a slot of the work alongside, see below
+            for w in work:
+                await w()
+            return
+        slots = asyncio.Semaphore(self.args.parallel)
+
+        async def alongside(w):
+            async with slots:
+                await self.apart(w)
+
+        await asyncio.gather(*(alongside(w) for w in work))
+
     async def dive(self, p, m, sv, indent, goal=None):
         """At a position where adding the engine's lines does not bring cdb's score of our move m
         closer to the engine's, go down that line for a while: search the position longer on the
         auxiliary threads (--diveNodes), and prove the engine's line from there as from the root,
         then look at the position again, with the longer search's score. Dives do not nest, and
         there are at most --dives of them per round. Returns whether cdb agrees then."""
-        if self.diving or self.divesLeft <= 0:
+        if DIVING.get() or self.divesLeft <= 0:
             return False
         self.divesLeft -= 1
-        self.diving = True
+        DIVING.set(True)
         try:
             at = self.root.variation_san(p.move_stack[len(self.root.move_stack) :])
             w = 1 if p.turn == chess.WHITE else -1
-            print(f"{indent}diving into {at or '(root)'}", flush=True)
+            self.say(f"{indent}diving into {at or '(root)'}")
             pv, score = await self.live.aux_line(p, self.args.diveNodes)
             if not pv or score is None:
                 return False
@@ -678,10 +743,9 @@ class SFGuide:
             )
             await self.propagate(p)
             after = (await self.cdb_now(p)).get(pv[0].uci())
-            print(
+            self.say(
                 f"{indent}the dive is over: {p.san(pv[0])}: cdb {f'{w * before:+}' if before is not None else 'unscored'} -> {f'{w * after:+}' if after is not None else 'unscored'},"
                 f" the dive's search {w * score:+} (the short one {w * sv:+} for {p.san(m)})",
-                flush=True,
             )
             self.log(
                 "dive",
@@ -695,7 +759,7 @@ class SFGuide:
                 self.agree(after, score) or self.enough(after, score, goal)
             )
         finally:
-            self.diving = False
+            DIVING.set(False)
 
     async def cdb_view(self, board, move):
         """cdb's current best move at board, its score, and cdb's score for the given move"""
@@ -1288,8 +1352,22 @@ async def refute_rounds(args, root, guide, live, safely):
         await safely(guide.report, root)
         guide.log("round", background=live.background(), root=await guide.cdb_now(root))
         guide.divesLeft = args.dives
+        started = time.monotonic(), live.busy, guide.cdbWait, guide.cdbQueries
         await safely(guide.refute, root)
-        guide.log("roundEnd", root=await guide.cdb_now(root))
+        seconds = time.monotonic() - started[0]
+        guide.log(
+            "roundEnd",
+            root=await guide.cdb_now(root),
+            seconds=seconds,
+            engine=live.busy - started[1],
+            cdbWait=guide.cdbWait - started[2],
+            cdbQueries=guide.cdbQueries - started[3],
+        )
+        print(
+            f"  the round took {seconds / 60:.0f} minutes: the engine was busy {(live.busy - started[1]) / 60:.0f} of them,"
+            f" and {guide.cdbQueries - started[3]} queries waited {(guide.cdbWait - started[2]) / 60:.0f} minutes for cdb in all",
+            flush=True,
+        )
         print(flush=True)
 
 
@@ -1446,6 +1524,12 @@ if __name__ == "__main__":
     argParser.add_argument(
         "--diveMarks",
         help="With --dives: repair at most this many defences against the line of a dive, each with half of --repairBudget.",
+        type=int,
+        default=3,
+    )
+    argParser.add_argument(
+        "--parallel",
+        help="With --refute: repair this many lines alongside each other, as cdb's answers take long.",
         type=int,
         default=3,
     )

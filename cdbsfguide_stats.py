@@ -163,6 +163,13 @@ def refute_summary(run, args):
     candidates = [r for r in run if r["event"] == "candidate"]
     defences = [r for r in run if r["event"] == "defence"]
     lineEnds = {r["round"]: r for r in run if r["event"] == "lineEnd"}
+    # the end of each round, by the round and the time of its start
+    roundEnds, start = {}, None
+    for r in run:
+        if r["event"] == "round":
+            start = (r["round"], r["time"])
+        elif r["event"] == "roundEnd" and start:
+            roundEnds[start] = r
     errors = [r for r in run if r["event"] == "error"]
     if not rounds:
         print("  no rounds yet")
@@ -175,7 +182,7 @@ def refute_summary(run, args):
     print(
         f"\n{'time':<16} {'round':>5} {'background':>17} | "
         + " ".join(f"{m:>6}" for m in moves)
-        + " | PV disagreements | repaired: lines, fixes, searches"
+        + " | PV disagreements | repaired: lines, fixes, searches | minutes: round, engine busy, cdb waits"
     )
     for r in rounds:
         bg = r["background"]
@@ -184,9 +191,15 @@ def refute_summary(run, args):
         w = walks.get(r["round"])
         mine = [c for c in candidates + defences if c["round"] == r["round"]]
         mine += [lineEnds[r["round"]]] if r["round"] in lineEnds else []
+        end = roundEnds.get((r["round"], r["time"]))
+        took = (
+            f" | {end['seconds'] / 60:.0f}, {end['engine'] / 60:.0f}, {end['cdbWait'] / 60:.0f}"
+            if end and "seconds" in end
+            else ""
+        )
         print(
             f"{r['time'][:16]:<16} {r['round']:>5} {bgs:>17} | {root} | {w['disagreements'] if w else '-':>17} |"
-            f" {len(mine)}, {sum(c['fixes'] for c in mine)}, {sum(c['searches'] for c in mine)}"
+            f" {len(mine)}, {sum(c['fixes'] for c in mine)}, {sum(c['searches'] for c in mine)}{took}"
         )
     if candidates:
         n = len(candidates)

@@ -200,6 +200,7 @@ It has four modes:
   From the bottom of the line up, it compares cdb's score of the engine's move with the engine's score, and at the deepest position where they differ by more than `--tol` cp, unless both see the same side 400 cp or more ahead, it adds the engine's line to cdb, and if cdb is too pessimistic for that side, the engine's refutation of cdb's defence against the move; it queries the lines from their ends back up to the root, and extends them from their ends with further short searches, as long as that brings cdb's score closer to the engine's.
   When two additions in a row do not, cdb's own evals of the positions on these lines differ from the engine's, and more positions would not change that.
   Positions that agree, or that could not be brought closer, are skipped until cdb's score of the engine's move there changes, so that every new look at the line (`--repairs`) reaches further up, while its share of the `--repairBudget` searches lasts.
+  The repairs of the defences and of the end of the line run alongside each other (`--parallel`), as cdb answers each query only after most of a second, and the queries along a line have to go one after the other, from its end up; the short searches take turns on the auxiliary threads.
   The engine's values far from the leaves never decide: they miss what only long lines show, and underestimate advantages that only show deep in the endgame.
   Adding positions to cdb does not make its minimax worse, so where a short search is wrong, cdb's own scores of the added positions settle it.
   Where adding the engine's lines does not bring cdb closer, it goes down that line for a while (up to `--dives` times per round): a longer search on the auxiliary threads (`--diveNodes`) gives a more reliable line and score at that position, and it proves that line from there as from the root, repairing up to `--diveMarks` defences against it with half of `--repairBudget` each, before it looks at the position again. The background search stays at the root.
@@ -229,8 +230,8 @@ python cdbsfguide_stats.py kq.jsonl --plot kq.png
 ```
 
 ```
-usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--live] [--refute] [--pvPlies PVPLIES] [--leafNodes LEAFNODES] [--proofPlies PROOFPLIES] [--repairs REPAIRS] [--repairBudget REPAIRBUDGET] [--tol TOL] [--margin MARGIN] [--dives DIVES] [--diveNodes DIVENODES] [--diveMarks DIVEMARKS] [--maxMarks MAXMARKS] [--auxThreads AUXTHREADS] [--attach ATTACH] [--prefillNodes PREFILLNODES]
-                     [--minDepth MINDEPTH] [--auxNodes AUXNODES] [--scoreGap] [--threshold THRESHOLD] [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--stats STATS] [--holdout HOLDOUT] [--holdoutPly HOLDOUTPLY] [--seed SEED] [--concurrency CONCURRENCY] [--evalDecay EVALDECAY] [--user USER] [--suppressErrors]
+usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--live] [--refute] [--pvPlies PVPLIES] [--leafNodes LEAFNODES] [--proofPlies PROOFPLIES] [--repairs REPAIRS] [--repairBudget REPAIRBUDGET] [--tol TOL] [--margin MARGIN] [--dives DIVES] [--diveNodes DIVENODES] [--diveMarks DIVEMARKS] [--parallel PARALLEL] [--maxMarks MAXMARKS] [--auxThreads AUXTHREADS] [--attach ATTACH]
+                     [--prefillNodes PREFILLNODES] [--minDepth MINDEPTH] [--auxNodes AUXNODES] [--scoreGap] [--threshold THRESHOLD] [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--stats STATS] [--holdout HOLDOUT] [--holdoutPly HOLDOUTPLY] [--seed SEED] [--concurrency CONCURRENCY] [--evalDecay EVALDECAY] [--user USER] [--suppressErrors]
 
 Use Stockfish to find the positions where cdb's main lines are likely wrong, and explore those with cdbsearch.
 
@@ -263,6 +264,7 @@ options:
                         With --dives: the nodes of the longer search of a dive. (default: 500000000)
   --diveMarks DIVEMARKS
                         With --dives: repair at most this many defences against the line of a dive, each with half of --repairBudget. (default: 3)
+  --parallel PARALLEL   With --refute: repair this many lines alongside each other, as cdb's answers take long. (default: 3)
   --maxMarks MAXMARKS   With --refute: repair at most this many defences against the engine's line per round. (default: 6)
   --auxThreads AUXTHREADS
                         With --refute: the number of threads of the auxiliary searches. (default: 3)
