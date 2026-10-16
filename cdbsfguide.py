@@ -265,6 +265,7 @@ class SFGuide:
         # with --refute: how often each defence has been repaired, and the positions
         # where cdb agreed with the engine, or could not be brought closer, with cdb's score then
         self.repaired, self.agreed, self.stalled = {}, {}, {}
+        self.searched = {}  # the short searches, by position
 
     def log(self, event, **record):
         """append a record to the statistics file, see cdbsfguide_stats.py"""
@@ -315,15 +316,68 @@ class SFGuide:
             or max(cv, sv) <= -DECIDED
         )
 
-    async def cdb_line(self, start):
-        """the positions of cdb's PV from start, to the leaf of its tree"""
+    async def engine_view(self, board, budget):
+        """the engine's line from board and its score for the side to move, by a short search, which
+        is done once per position: None if it is not known yet and the budget is used up
+        """
+        epd = board.epd()
+        if epd not in self.searched:
+            if budget[0] <= 0:
+                return None
+            budget[0] -= 1
+            self.searched[epd] = await self.short(board)
+        return self.searched[epd]
+
+    async def proof_line(self, start, budget):
+        """The line from start that proves the engine's line for our side, the side to move at the
+        root: our side plays the engine's moves, and the opponent cdb's best defences, along cdb's
+        PV, to the leaf of cdb's tree. Positions that cdb reaches only by another move of ours are
+        not on it: we would not play into them. Returns the positions with their moves, and at our
+        side's positions the engine's line and score, or None where the move is that of the
+        background search's TT, deep enough to trust; and the last position."""
         if self.measureDB is None:
             self.measureDB = self.chessdb(start)
-        line, b = [start.copy()], start.copy()
-        for m in self.live.to_moves(b, await self.measureDB.querypv(b.epd()) or []):
+        line, b, seen = [], start.copy(), set()
+        cdb, i = (
+            None,
+            0,
+        )  # cdb's PV from some position on the line, and where we are on it
+        while (
+            len(line) < self.args.proofPlies
+            and not self.final(b)
+            and b.epd() not in seen
+        ):
+            seen.add(b.epd())
+            if cdb is None:
+                cdb, i = (
+                    self.live.to_moves(b, await self.measureDB.querypv(b.epd()) or []),
+                    0,
+                )
+            if b.turn == self.root.turn:
+                node = await self.live.probe(b)
+                if (
+                    node.get("hit") == "1"
+                    and int(node["depth"]) >= self.args.minDepth
+                    and node.get("move", "none") != "none"
+                ):
+                    m, view = chess.Move.from_uci(node["move"]), None
+                else:
+                    view = await self.engine_view(b, budget)
+                    if not view or not view[0]:
+                        break
+                    m = view[0][0]
+                if i < len(cdb) and cdb[i] == m:
+                    i += 1
+                else:  # cdb plays another move: ask for its PV after ours
+                    cdb = None
+            elif i < len(cdb):
+                m, view = cdb[i], None
+                i += 1
+            else:  # the leaf of cdb's tree
+                break
+            line.append((b.copy(), m, view))
             b.push(m)
-            line.append(b.copy())
-        return line
+        return line, b
 
     async def add_line(self, board, pv):
         """add the positions of a line from board to cdb, and query them from the end of the line up
@@ -341,111 +395,102 @@ class SFGuide:
         await self.propagate(line[-1])
         return line[-1]
 
-    async def fix(self, p, budget, indent, known=None):
-        """Bring cdb's value of p closer to the engine's, by adding the engine's lines from p to cdb:
-        its own line, and where cdb is too optimistic for the side to move and plays another move, its
-        refutation of that move. Then extend the lines from their ends with further short searches, as
-        long as that brings cdb's value closer. Returns whether cdb agrees in the end. When adding
-        lines twice in a row does not bring cdb closer, cdb's own evals of the positions on the lines
-        differ from the engine's, and more positions would not change that: then p is not tried again
-        until cdb's score of it changes."""
+    async def fix(self, p, m, view, budget, indent):
+        """Bring cdb's score of our move m at p closer to the engine's score of it, by adding the
+        engine's lines to cdb: its own line from p, and where cdb is too pessimistic for us, its
+        refutation of cdb's defence against m. Then extend the lines from their ends with further
+        short searches, as long as that brings cdb's score closer. Returns whether cdb agrees in the
+        end. When adding lines twice in a row does not bring cdb closer, cdb's own evals of the
+        positions on the lines differ from the engine's, and more positions would not change that:
+        then p is not tried again until cdb's score of m changes."""
+        pv, sv = view
         moves = await self.cdb_now(p)
-        if not moves:
-            return False
-        if known is None:
-            if budget[0] <= 0:
-                return False
-            budget[0] -= 1
-            known = await self.short(p)
-        pv, sv = known
-        if sv is None or not pv:
-            return False
-        best = max(moves, key=moves.get)
-        gap = moves[best] - sv
-        if self.agree(moves[best], sv):
-            self.agreed[p.epd()] = moves[best]
-            return True
+        cm = moves.get(m.uci())
         w = 1 if p.turn == chess.WHITE else -1
-        bestMove = chess.Move.from_uci(best)
         lines = [(p, pv)]
-        if gap > 0 and pv[0] != bestMove and budget[0] > 0:
-            budget[0] -= 1
-            refutation, _ = await self.short(p, bestMove)
-            if refutation:
-                lines.append((p, refutation))
+        child = p.copy()
+        child.push(m)
+        replies = await self.cdb_now(child) if cm is not None and cm < sv else {}
+        if replies:
+            defence = chess.Move.from_uci(max(replies, key=replies.get))
+            if (len(pv) < 2 or pv[1] != defence) and budget[0] > 0:
+                budget[0] -= 1
+                refutation, _ = await self.short(child, defence)
+                if refutation:
+                    lines.append((child, refutation))
         print(
-            f"{indent}{p.fullmove_number}{'.' if p.turn else '...'} cdb {p.san(bestMove)} {w * moves[best]:+}, engine {p.san(pv[0])} {w * sv:+}: "
+            f"{indent}{p.fullmove_number}{'.' if p.turn else '...'} {p.san(m)}: cdb {f'{w * cm:+}' if cm is not None else 'unscored'}, engine {w * sv:+}: "
             + (
                 "add the engine's line"
                 if len(lines) == 1
-                else f"add the engine's line, and its refutation of {p.san(bestMove)}"
+                else f"add the engine's line, and its refutation of {child.san(defence)}"
             ),
             flush=True,
         )
-        stalls = 0
+        gap, stalls = cm - sv if cm is not None else None, 0
         while True:
             ends = [await self.add_line(b, l) for b, l in lines]
-            moves = await self.cdb_now(p)
-            best = max(moves, key=moves.get)
-            newGap = moves[best] - sv
+            cm = (await self.cdb_now(p)).get(m.uci())
             print(
-                f"{indent}  {sum(len(l) for _, l in lines)} plies added, cdb now {p.san(chess.Move.from_uci(best))} {w * moves[best]:+}",
+                f"{indent}  {sum(len(l) for _, l in lines)} plies added, cdb now {f'{w * cm:+}' if cm is not None else 'unscored'}",
                 flush=True,
             )
-            if self.agree(moves[best], sv):
-                self.agreed[p.epd()] = moves[best]
+            if cm is None:
+                return False
+            if self.agree(cm, sv):
+                self.agreed[p.epd()] = cm
                 return True
-            stalls = stalls + 1 if abs(newGap) > abs(gap) - self.args.tol / 2 else 0
+            newGap = cm - sv
+            if gap is not None and abs(newGap) > abs(gap) - self.args.tol / 2:
+                stalls += 1
+            else:
+                stalls = 0
             gap = newGap
             if stalls >= 2:
-                self.stalled[p.epd()] = moves[best]
+                self.stalled[p.epd()] = cm
                 return False
             # extend the lines from their ends
             lines = []
             for e in ends:
-                if self.final(e) or budget[0] <= 0:
+                if self.final(e):
                     continue
-                budget[0] -= 1
-                more, _ = await self.short(e)
-                if more:
-                    lines.append((e, more))
+                more = await self.engine_view(e, budget)
+                if more and more[0]:
+                    lines.append((e, more[0]))
             if not lines:
                 return False
 
     async def repair(self, start, budget, indent):
-        """Repair cdb's line from start from the bottom up: follow it to the leaf of cdb's tree, check
-        its positions upward with short searches, which are reliable near the leaves, and fix the
-        deepest disagreement; then look at the line again, as cdb may now play another one. Positions
-        that agreed, or that could not be brought closer, are skipped until cdb's score of them changes,
-        so that each look reaches further up the line."""
+        """Repair the line from start that proves the engine's line for our side, from the bottom up:
+        follow it to the leaf of cdb's tree, compare cdb's scores of our moves on it with the
+        engine's from the bottom up, and fix the deepest disagreement; then look at the line again,
+        as cdb may now defend differently. Positions that agreed, or that could not be brought
+        closer, are skipped until cdb's score of our move changes, so that each look reaches further
+        up the line."""
         fixes = 0
         for attempt in range(self.args.repairs):
-            line = await self.cdb_line(start)
-            target, checked = None, 0
-            for p in reversed(line):
-                if checked >= self.args.scanPlies or budget[0] <= 0:
-                    break
-                if self.final(p):
+            line, _ = await self.proof_line(start, budget)
+            target = None
+            for p, m, view in reversed(line):
+                if view is None or view[1] is None:
+                    continue  # the opponent's move, or the background search's
+                cm = (await self.cdb_now(p)).get(m.uci())
+                if cm is not None and cm in (
+                    self.agreed.get(p.epd()),
+                    self.stalled.get(p.epd()),
+                ):
                     continue
-                moves = await self.cdb_now(p)
-                if not moves:
+                if cm is not None and self.agree(cm, view[1]):
+                    self.agreed[p.epd()] = cm
                     continue
-                v = max(moves.values())
-                if v in (self.agreed.get(p.epd()), self.stalled.get(p.epd())):
-                    continue
-                checked += 1
-                budget[0] -= 1
-                found = await self.short(p)
-                if found[1] is None:
-                    continue
-                if not self.agree(v, found[1]):
-                    target = p
-                    break
-                self.agreed[p.epd()] = v
+                target = (p, m, view)
+                break
             if target is None:
                 break
             fixes += 1
-            await self.fix(target, budget, indent, found)
+            await self.fix(*target, budget, indent)
+            if budget[0] <= 0:
+                break
         return fixes
 
     async def refute(self, root):
@@ -1259,10 +1304,10 @@ if __name__ == "__main__":
         default=50000000,
     )
     argParser.add_argument(
-        "--scanPlies",
-        help="With --refute: check at most this many positions of a line from its leaf upward, at each look at it, besides those that agreed before.",
+        "--proofPlies",
+        help="With --refute: follow a line that proves the engine's line at most this many plies.",
         type=int,
-        default=20,
+        default=60,
     )
     argParser.add_argument(
         "--repairs",

@@ -194,10 +194,11 @@ It has four modes:
   At the opponent's positions on the line, every move that cdb scores more than `--margin` cp better for the opponent than the engine's move is a defence against the line, which caps cdb's score of it.
   Each round, it repairs the end of the line, and cdb's lines after up to `--maxMarks` defences: those repaired the fewest times so far, the ones closest to the root first, as the shallowest defence on cdb's path caps its score of the line, and among those the largest gaps.
   Where cdb scores another move of the side to move at the root above the engine's, nothing needs doing: the line only has to be proven good, and a move cdb wrongly prefers to it does not lower cdb's score of it.
-  To repair a line, it follows cdb's PV to the leaf of cdb's tree, and checks its positions upward with short searches (`--leafNodes`) on the auxiliary threads (`--auxThreads`), of the positions as cdb sees them, without the moves that led to them.
-  At the deepest position where cdb's value differs from the engine's by more than `--tol` cp, unless both see the same side 400 cp or more ahead, it adds the engine's line to cdb, and if cdb is too optimistic for the side to move and plays another move, the engine's refutation of that move; it queries the lines from their ends back up to the root, and extends them from their ends with further short searches, as long as that brings cdb's value closer to the engine's.
+  To repair a line, it follows the line that proves the engine's line for the side to move at the root, as far as cdb's tree goes (`--proofPlies`): that side plays the engine's moves, and the opponent cdb's best defences, along cdb's PV. Positions that cdb reaches only by another move of that side are not on it, as that side would not play into them.
+  At that side's positions, the engine's move comes from the TT of the background search where its entry has a depth of at least `--minDepth`, and otherwise from a short search (`--leafNodes`) on the auxiliary threads (`--auxThreads`) of the position as cdb sees it, without the moves that led to it; each position is searched once.
+  From the bottom of the line up, it compares cdb's score of the engine's move with the engine's score, and at the deepest position where they differ by more than `--tol` cp, unless both see the same side 400 cp or more ahead, it adds the engine's line to cdb, and if cdb is too pessimistic for that side, the engine's refutation of cdb's defence against the move; it queries the lines from their ends back up to the root, and extends them from their ends with further short searches, as long as that brings cdb's score closer to the engine's.
   When two additions in a row do not, cdb's own evals of the positions on these lines differ from the engine's, and more positions would not change that.
-  Positions that agree, or that could not be brought closer, are skipped until cdb's score of them changes, so that every new look at the line (`--repairs`) reaches further up, while its share of the `--repairBudget` searches lasts.
+  Positions that agree, or that could not be brought closer, are skipped until cdb's score of the engine's move there changes, so that every new look at the line (`--repairs`) reaches further up, while its share of the `--repairBudget` searches lasts.
   The engine's values far from the leaves never decide: they miss what only long lines show, and underestimate advantages that only show deep in the endgame.
   Adding positions to cdb does not make its minimax worse, so where a short search is wrong, cdb's own scores of the added positions settle it.
 
@@ -226,7 +227,7 @@ python cdbsfguide_stats.py kq.jsonl --plot kq.png
 ```
 
 ```
-usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--live] [--refute] [--pvPlies PVPLIES] [--leafNodes LEAFNODES] [--scanPlies SCANPLIES] [--repairs REPAIRS] [--repairBudget REPAIRBUDGET] [--tol TOL] [--margin MARGIN] [--maxMarks MAXMARKS] [--auxThreads AUXTHREADS] [--attach ATTACH] [--prefillNodes PREFILLNODES] [--minDepth MINDEPTH] [--auxNodes AUXNODES] [--scoreGap]
+usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--live] [--refute] [--pvPlies PVPLIES] [--leafNodes LEAFNODES] [--proofPlies PROOFPLIES] [--repairs REPAIRS] [--repairBudget REPAIRBUDGET] [--tol TOL] [--margin MARGIN] [--maxMarks MAXMARKS] [--auxThreads AUXTHREADS] [--attach ATTACH] [--prefillNodes PREFILLNODES] [--minDepth MINDEPTH] [--auxNodes AUXNODES] [--scoreGap]
                      [--threshold THRESHOLD] [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--stats STATS] [--holdout HOLDOUT] [--holdoutPly HOLDOUTPLY] [--seed SEED] [--concurrency CONCURRENCY] [--evalDecay EVALDECAY] [--user USER] [--suppressErrors]
 
 Use Stockfish to find the positions where cdb's main lines are likely wrong, and explore those with cdbsearch.
@@ -248,8 +249,8 @@ options:
   --pvPlies PVPLIES     With --refute: the length of the background search's PV to walk. (default: 100)
   --leafNodes LEAFNODES
                         With --refute: the nodes of the short searches near the leaves, which decide. (default: 50000000)
-  --scanPlies SCANPLIES
-                        With --refute: check at most this many positions of a line from its leaf upward, at each look at it, besides those that agreed before. (default: 20)
+  --proofPlies PROOFPLIES
+                        With --refute: follow a line that proves the engine's line at most this many plies. (default: 60)
   --repairs REPAIRS     With --refute: look at a line this many times, each time fixing its deepest disagreement. (default: 3)
   --repairBudget REPAIRBUDGET
                         With --refute: the short searches available for repairing a line. (default: 60)
