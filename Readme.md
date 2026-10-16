@@ -210,9 +210,13 @@ The disagreements of the first walk serve as a fixed set: every walk records whe
 With `--holdout`, a random part of them (at least `--holdoutPly` plies from the root) is never explored, nor are the lines below them, as a control group: comparing the explored disagreements with the held out ones tells the effect of the run from cdb's own drift.
 `cdbsfguide_stats.py FILE --plot FILE.png` summarises such a file.
 
+To change the program during a long run without losing the background search and its TT, run the engine under `uciserver.py`, which serves it on a Unix socket to one client at a time and keeps it running when the client ends, and give `cdbsfguide.py` the socket with `--attach` instead of `--engine`.
+A later run from the same root, maybe with new code, attaches to the running search; the engine stops with the server.
+
 Example of a run without end that repairs lines itself, for the start position in which only White may castle:
 ```shell
-python cdbsfguide.py --live --refute --epd "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQ - 0 1" --engine Stockfish/src/stockfish --threads 5 --hash 32768 --auxThreads 3 --rounds 0 --stats kq.jsonl >& kq.log &
+python uciserver.py --engine Stockfish/src/stockfish --socket sf.sock >& uciserver.log &
+python cdbsfguide.py --live --refute --attach sf.sock --epd "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQ - 0 1" --threads 5 --hash 32768 --auxThreads 3 --rounds 0 --stats kq.jsonl >& kq.log &
 ```
 
 Example of a run without end that explores with `cdbsearch`, with a control group:
@@ -222,8 +226,8 @@ python cdbsfguide_stats.py kq.jsonl --plot kq.png
 ```
 
 ```
-usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--live] [--refute] [--pvPlies PVPLIES] [--leafNodes LEAFNODES] [--scanPlies SCANPLIES] [--repairs REPAIRS] [--repairBudget REPAIRBUDGET] [--tol TOL] [--margin MARGIN] [--maxMarks MAXMARKS] [--auxThreads AUXTHREADS] [--prefillNodes PREFILLNODES] [--minDepth MINDEPTH] [--auxNodes AUXNODES] [--scoreGap] [--threshold THRESHOLD]
-                     [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--stats STATS] [--holdout HOLDOUT] [--holdoutPly HOLDOUTPLY] [--seed SEED] [--concurrency CONCURRENCY] [--evalDecay EVALDECAY] [--user USER] [--suppressErrors]
+usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--live] [--refute] [--pvPlies PVPLIES] [--leafNodes LEAFNODES] [--scanPlies SCANPLIES] [--repairs REPAIRS] [--repairBudget REPAIRBUDGET] [--tol TOL] [--margin MARGIN] [--maxMarks MAXMARKS] [--auxThreads AUXTHREADS] [--attach ATTACH] [--prefillNodes PREFILLNODES] [--minDepth MINDEPTH] [--auxNodes AUXNODES] [--scoreGap]
+                     [--threshold THRESHOLD] [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--stats STATS] [--holdout HOLDOUT] [--holdoutPly HOLDOUTPLY] [--seed SEED] [--concurrency CONCURRENCY] [--evalDecay EVALDECAY] [--user USER] [--suppressErrors]
 
 Use Stockfish to find the positions where cdb's main lines are likely wrong, and explore those with cdbsearch.
 
@@ -254,6 +258,7 @@ options:
   --maxMarks MAXMARKS   With --refute: repair at most this many defences against the engine's line per round. (default: 6)
   --auxThreads AUXTHREADS
                         With --refute: the number of threads of the auxiliary searches. (default: 3)
+  --attach ATTACH       With --live: use the engine of a uciserver.py listening on this socket, instead of starting one. Its search goes on when this program ends, so that a later run, maybe with new code, can attach to it again and keep its TT. --engine is then not used, and --threads and --hash only if the engine is not searching yet. (default: None)
   --prefillNodes PREFILLNODES
                         With --live: the number of nodes the background search makes before the first walk. (default: 1000000000)
   --minDepth MINDEPTH   With --live: only trust TT entries of at least this depth. (default: 25)

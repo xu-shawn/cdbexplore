@@ -52,22 +52,55 @@ class LiveEngine:
     needs the ttprobe and ttmoves commands of the cdb-tt branch of Stockfish"""
 
     async def start(self, path, options):
+        """start the engine"""
         self.info, self.auxInfo, self.name, self.nodesSeen = "", "", path, 0
         self.replies = asyncio.Queue()
+        self.attached, self.searchPosition = False, None
         self.proc = await asyncio.create_subprocess_exec(
             path,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             limit=2**20,
         )
+        self.stdin, self.stdout = self.proc.stdin, self.proc.stdout
         self.reader = asyncio.create_task(self.read())
         await self.request("uci", lambda l: l == "uciok")
+        await self.configure(options)
+
+    async def attach(self, socket, options):
+        """use the engine of a uciserver.py listening on the socket: its search may be running"""
+        self.info, self.auxInfo, self.nodesSeen = "", "", 0
+        self.replies = asyncio.Queue()
+        self.stdout, self.stdin = await asyncio.open_unix_connection(
+            socket, limit=2**20
+        )
+        state = json.loads((await self.stdout.readline()).decode().partition(" ")[2])
+        if state.get("busy"):
+            raise RuntimeError(f"the uciserver on {socket} already has a client")
+        self.attached, self.name = True, state["name"]
+        self.searchPosition = state["position"] if state["searching"] else None
+        self.reader = asyncio.create_task(self.read())
+        if self.searchPosition is None:
+            await self.configure(options)
+        else:  # also reads the latest info lines of the search, which the server sends first
+            await self.request("isready", lambda l: l == "readyok")
+
+    async def configure(self, options):
         for name, value in options.items():
             self.send(f"setoption name {name} value {value}")
         await self.request("isready", lambda l: l == "readyok")
 
+    async def close(self):
+        """stop the engine, or leave it to its uciserver, searching"""
+        if self.attached:
+            self.stdin.close()
+        elif self.proc.returncode is None:
+            await self.request("stop", lambda l: l.startswith("bestmove"))
+            self.send("quit")
+            await self.proc.wait()
+
     async def read(self):
-        while line := await self.proc.stdout.readline():
+        while line := await self.stdout.readline():
             line = line.decode().strip()
             if line.startswith("aux info"):
                 # remember the latest complete iteration of the auxiliary search
@@ -91,7 +124,7 @@ class LiveEngine:
                 self.replies.put_nowait(line)
 
     def send(self, cmd):
-        self.proc.stdin.write((cmd + "\n").encode())
+        self.stdin.write((cmd + "\n").encode())
 
     async def request(self, cmd, last):
         """send a command, and return the lines of its reply, up to the one for which last() holds"""
@@ -132,12 +165,14 @@ class LiveEngine:
     def nodes(self):
         return self.nodesSeen
 
+    def position_command(self, board):
+        """the command for the position on board, with the moves leading to it"""
+        moves = " ".join(m.uci() for m in board.move_stack)
+        return f"position fen {board.root().fen()}" + bool(moves) * f" moves {moves}"
+
     def position(self, board):
         """set the engine's position to the one on board, with the moves leading to it"""
-        moves = " ".join(m.uci() for m in board.move_stack)
-        self.send(
-            f"position fen {board.root().fen()}" + bool(moves) * f" moves {moves}"
-        )
+        self.send(self.position_command(board))
 
     async def aux_search(self, board, nodes, move=None):
         """a search of the auxiliary thread, which shares the TT with the background search:
@@ -1013,9 +1048,12 @@ async def main(args, root):
         options["UCI_Chess960"] = True
     if args.live:
         engine, live = None, LiveEngine()
-        await live.start(args.engine, options)
+        if args.attach:
+            await live.attach(args.attach, options)
+        else:
+            await live.start(args.engine, options)
         name, budget = (
-            live.name,
+            live.name + bool(args.attach) * f" of the uciserver on {args.attach}",
             f"a background search of at least {args.prefillNodes} nodes",
         )
     else:
@@ -1035,7 +1073,9 @@ async def main(args, root):
         await run(args, root, guide, engine, live if args.live else None)
     finally:
         guide.log("stop")
-        if args.live and live.proc.returncode is None:
+        if args.live and live.attached:
+            live.stdin.close()
+        elif args.live and live.proc.returncode is None:
             live.send("stop")
             live.send("quit")
 
@@ -1056,8 +1096,15 @@ async def run(args, root, guide, engine, live):
     if args.live:
         # one search from the root keeps running, and keeps filling the TT that we probe
         guide.live = live
-        live.position(root)
-        live.send("go infinite")
+        if live.searchPosition == live.position_command(root):
+            print(f"  attached to the running search: {live.status()}", flush=True)
+        elif live.searchPosition is not None:
+            raise RuntimeError(
+                f"the engine of the uciserver searches another position: {live.searchPosition}"
+            )
+        else:
+            live.position(root)
+            live.send("go infinite")
         last = 0
         while live.nodes() < args.prefillNodes:
             await asyncio.sleep(5)
@@ -1079,9 +1126,7 @@ async def run(args, root, guide, engine, live):
     if pending:
         await asyncio.wait(pending, timeout=120)
     if args.live:
-        await live.request("stop", lambda l: l.startswith("bestmove"))
-        live.send("quit")
-        await live.proc.wait()
+        await live.close()
     else:
         await engine.quit()
 
@@ -1254,6 +1299,10 @@ if __name__ == "__main__":
         help="With --refute: the number of threads of the auxiliary searches.",
         type=int,
         default=3,
+    )
+    argParser.add_argument(
+        "--attach",
+        help="With --live: use the engine of a uciserver.py listening on this socket, instead of starting one. Its search goes on when this program ends, so that a later run, maybe with new code, can attach to it again and keep its TT. --engine is then not used, and --threads and --hash only if the engine is not searching yet.",
     )
     argParser.add_argument(
         "--prefillNodes",
