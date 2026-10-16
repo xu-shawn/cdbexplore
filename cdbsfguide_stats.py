@@ -74,7 +74,7 @@ def main():
     if start["event"] == "start":
         print(f"  engine {start['engine']}, root {start['root']}")
     if (
-        any(r["event"] == "candidate" for r in run)
+        any(r["event"] in ("candidate", "defence") for r in run)
         or not walks
         and any(r["event"] == "round" for r in run)
     ):
@@ -161,6 +161,8 @@ def refute_summary(run, args):
     rounds = [r for r in run if r["event"] == "round"]
     walks = {r["round"]: r for r in run if r["event"] == "pvwalk"}
     candidates = [r for r in run if r["event"] == "candidate"]
+    defences = [r for r in run if r["event"] == "defence"]
+    lineEnds = {r["round"]: r for r in run if r["event"] == "lineEnd"}
     errors = [r for r in run if r["event"] == "error"]
     if not rounds:
         print("  no rounds yet")
@@ -173,14 +175,15 @@ def refute_summary(run, args):
     print(
         f"\n{'time':<16} {'round':>5} {'background':>17} | "
         + " ".join(f"{m:>6}" for m in moves)
-        + " | PV disagreements | repaired: positions, fixes, searches"
+        + " | PV disagreements | repaired: lines, fixes, searches"
     )
     for r in rounds:
         bg = r["background"]
         bgs = f"d{bg['depth']} {bg['nodes'] / 1e9:7.1f}B" if bg else "-"
         root = " ".join(f"{r['root'].get(m, 0):+6}" for m in moves)
         w = walks.get(r["round"])
-        mine = [c for c in candidates if c["round"] == r["round"]]
+        mine = [c for c in candidates + defences if c["round"] == r["round"]]
+        mine += [lineEnds[r["round"]]] if r["round"] in lineEnds else []
         print(
             f"{r['time'][:16]:<16} {r['round']:>5} {bgs:>17} | {root} | {w['disagreements'] if w else '-':>17} |"
             f" {len(mine)}, {sum(c['fixes'] for c in mine)}, {sum(c['searches'] for c in mine)}"
@@ -204,6 +207,23 @@ def refute_summary(run, args):
             f" cdb's preference of its best move over the engine's narrowed in {fraction(narrowed, len(both))} (by {dgap:+.1f} cp on average),"
             f" and its score of its best move changed by {dbest:+.1f} cp on average."
         )
+    if defences:
+        gaps = [
+            (
+                d["before"]["defence"] - d["before"]["engineMove"],
+                d["after"]["defence"] - d["after"]["engineMove"],
+            )
+            for d in defences
+            if None not in (*d["before"].values(), *d["after"].values())
+        ]
+        narrowed = sum(after < before for before, after in gaps)
+        gone = sum(after <= 0 for _, after in gaps)
+        dgap = sum(after - before for before, after in gaps) / max(len(gaps), 1)
+        print(
+            f"\n{len(defences)} repairs of {len({(d['line'], d['defence']) for d in defences})} defences against the engine's line,"
+            f" {sum(d['searches'] for d in defences)} short searches: cdb's preference of the defence over the engine's move"
+            f" narrowed in {fraction(narrowed, len(gaps))} (by {dgap:+.1f} cp on average), and is gone in {fraction(gone, len(gaps))}."
+        )
     if errors:
         print(f"{len(errors)} errors, the last one: {errors[-1]['message']}")
     # the scores at the root after the last round, or at its start if it has not ended
@@ -216,7 +236,7 @@ def refute_summary(run, args):
         if None not in (a, b):
             print(f"  cdb's score of {m} at the root: {a:+} -> {b:+}")
     if args.plot:
-        plot_refute(rounds, candidates, moves, args.plot)
+        plot_refute(rounds, candidates + defences, moves, args.plot)
 
 
 def plot_refute(rounds, candidates, moves, path):
@@ -237,10 +257,16 @@ def plot_refute(rounds, candidates, moves, path):
     tc = [datetime.fromisoformat(c["time"]) for c in candidates]
     adopted, cum = 0, []
     for c in candidates:
-        adopted += c["after"]["best"] == c["engineMove"]
+        after = c["after"]
+        if "best" in after:
+            adopted += after["best"] == c["engineMove"]
+        else:  # a defence, refuted once cdb no longer prefers it to the engine's move
+            adopted += (
+                None not in after.values() and after["defence"] <= after["engineMove"]
+            )
         cum.append(adopted)
-    axes[1].plot(tc, range(1, len(tc) + 1), label="repaired positions")
-    axes[1].plot(tc, cum, label="cdb then played the engine's move")
+    axes[1].plot(tc, range(1, len(tc) + 1), label="repairs")
+    axes[1].plot(tc, cum, label="cdb then preferred the engine's move")
     axes[1].set_ylabel("cumulative")
     axes[1].legend(fontsize=8)
     for ax in axes:

@@ -227,7 +227,7 @@ class SFGuide:
         # positions of the first walk that are never explored, as a control, and those of its
         # disagreements without other ones below them
         self.heldOut, self.leaves = set(), set()
-        # with --refute: how often the lines at each position have been repaired, and the positions
+        # with --refute: how often each defence has been repaired, and the positions
         # where cdb agreed with the engine, or could not be brought closer, with cdb's score then
         self.repaired, self.agreed, self.stalled = {}, {}, {}
 
@@ -414,12 +414,16 @@ class SFGuide:
         return fixes
 
     async def refute(self, root):
-        """Walk the background search's PV to find where cdb ranks the moves differently from the
-        engine, then repair both competing lines at each such position from the bottom up, deepest
-        position first. Only short searches near the leaves decide: the engine's values far from the
-        leaves are not trusted, as they miss what only long lines show."""
+        """Prove the engine's line to cdb, for the side to move at the root. Walk the PV of the
+        background search as far as its TT entries are deep, and add its positions to cdb. At the
+        opponent's positions on it, every move that cdb scores better for the opponent than the
+        engine's move is a defence against the line, which caps cdb's score of it: repair cdb's
+        lines after those, from the bottom up, and the end of the engine's line too. Where cdb
+        scores another move of our side above the engine's, nothing needs doing: our line only has
+        to be proven good, and a move cdb wrongly prefers to it does not lower cdb's score of it.
+        """
         pv = await self.live.ttpv(root, self.args.pvPlies)
-        board, found = root.copy(), []
+        board, line = root.copy(), []
         for move in pv:
             if self.final(board):
                 break
@@ -427,77 +431,88 @@ class SFGuide:
             node = await self.live.probe(board)
             if node.get("hit") != "1" or int(node["depth"]) < self.args.minDepth:
                 break
-            moves = await self.cdb_now(board)
-            if not moves:
-                break
-            sf, best = board.uci(move), max(moves, key=moves.get)
-            cs = moves.get(sf)
-            if sf != best and (cs is None or moves[best] > cs + self.args.tol):
-                found.append((board.copy(), sf, best, cs, moves[best]))
+            line.append((board.copy(), move))
             board.push(move)
+        # add the line to cdb, and let cdb update its scores along it
+        await asyncio.gather(*(self.cdb_now(b) for b, _ in line[1:]))
+        if not self.final(board):
+            await self.cdb_now(board)
         await self.propagate(board)
-        walked = len(board.move_stack) - len(root.move_stack)
+
+        found = []  # the defences: position, the engine's move, the defence, its gap
+        for b, m in line:
+            if b.turn == root.turn:
+                continue
+            moves = await self.cdb_now(b)
+            ours = moves.get(b.uci(m))
+            if ours is None:
+                continue
+            for a, score in moves.items():
+                if a != b.uci(m) and score > ours + self.args.margin:
+                    found.append((b, m, chess.Move.from_uci(a), score - ours))
         print(
-            f"  the engine's PV, {walked} plies with TT entries of depth {self.args.minDepth} or more: {root.variation_san(pv[:12])} ...; cdb disagrees at {len(found)} positions",
+            f"  the engine's line, {len(line)} plies with TT entries of depth {self.args.minDepth} or more: {root.variation_san(pv[: min(len(line), 16)])} ...;"
+            f" cdb sees {len(found)} better defences against it",
             flush=True,
         )
-        self.log("pvwalk", plies=walked, disagreements=len(found))
-        # the largest disagreements first, among the positions repaired the fewest times so far
+        self.log("pvwalk", plies=len(line), disagreements=len(found))
+
+        # the end of the engine's line
+        budget = [self.args.repairBudget]
+        fixes = await self.repair(board, budget, "    ")
+        print(
+            f"  the end of the line: {fixes} fixes, {self.args.repairBudget - budget[0]} engine searches",
+            flush=True,
+        )
+        self.log("lineEnd", fixes=fixes, searches=self.args.repairBudget - budget[0])
+
+        # among the defences repaired the fewest times so far, those closest to the root first, as
+        # the shallowest defence on cdb's path caps its score of the line, then the largest gaps;
+        # each round repairs them deepest first
+        key = lambda t: (t[0].epd(), t[2].uci())
         chosen = sorted(
             found,
-            key=lambda t: (
-                self.repaired.get(t[0].epd(), 0),
-                t[3] - t[4] if t[3] is not None else -1000,
-            ),
+            key=lambda t: (self.repaired.get(key(t), 0), len(t[0].move_stack), -t[3]),
         )
-        for b, sf, best, cs, cb in sorted(
+        for b, m, a, gap in sorted(
             chosen[: self.args.maxMarks], key=lambda t: -len(t[0].move_stack)
         ):
-            line = (
+            at = (
                 self.root.variation_san(b.move_stack[len(self.root.move_stack) :])
                 or "(root)"
             )
             w = 1 if b.turn == chess.WHITE else -1
+            before = await self.cdb_now(b)
             print(
-                (
-                    f"  {line}: cdb {b.san(chess.Move.from_uci(best))} {w * cb:+} vs the engine's {b.san(chess.Move.from_uci(sf))} {w * cs:+}"
-                    if cs is not None
-                    else f"  {line}: cdb {b.san(chess.Move.from_uci(best))} {w * cb:+} vs the engine's {b.san(chess.Move.from_uci(sf))} (unscored)"
-                ),
+                f"  {at}: cdb {b.san(a)} {w * before[a.uci()]:+} vs the engine's {b.san(m)} {w * before[m.uci()]:+}",
                 flush=True,
             )
-            self.repaired[b.epd()] = self.repaired.get(b.epd(), 0) + 1
-            fixes = searches = 0
-            for m in (best, sf):  # each line gets half of the budget
-                child, budget = b.copy(), [self.args.repairBudget // 2]
-                child.push_uci(m)
-                fixes += await self.repair(child, budget, "    ")
-                searches += self.args.repairBudget // 2 - budget[0]
+            self.repaired[key((b, m, a))] = self.repaired.get(key((b, m, a)), 0) + 1
+            child, budget = b.copy(), [self.args.repairBudget]
+            child.push(a)
+            fixes = await self.repair(child, budget, "    ")
             await self.propagate(b)
             after = await self.cdb_now(b)
-            newBest = max(after, key=after.get)
             print(
-                f"    after {fixes} fixes and {searches} engine searches: cdb {b.san(chess.Move.from_uci(newBest))} {w * after[newBest]:+}, "
-                + (
-                    f"{b.san(chess.Move.from_uci(sf))} {w * after[sf]:+}"
-                    if sf in after
-                    else f"{b.san(chess.Move.from_uci(sf))} unscored"
+                (
+                    f"    after {fixes} fixes and {self.args.repairBudget - budget[0]} engine searches: cdb {b.san(a)} {w * after[a.uci()]:+}, {b.san(m)} {w * after[m.uci()]:+}"
+                    if a.uci() in after and m.uci() in after
+                    else f"    after {fixes} fixes and {self.args.repairBudget - budget[0]} engine searches"
                 ),
                 flush=True,
             )
             self.log(
-                "candidate",
-                line=line,
-                engineMove=sf,
-                cdbMove=best,
-                before={"best": best, "bestScore": cb, "engineMove": cs},
-                after={
-                    "best": newBest,
-                    "bestScore": after[newBest],
-                    "engineMove": after.get(sf),
+                "defence",
+                line=at,
+                engineMove=m.uci(),
+                defence=a.uci(),
+                before={
+                    "defence": before.get(a.uci()),
+                    "engineMove": before.get(m.uci()),
                 },
+                after={"defence": after.get(a.uci()), "engineMove": after.get(m.uci())},
                 fixes=fixes,
-                searches=searches,
+                searches=self.args.repairBudget - budget[0],
             )
 
     async def cdb_view(self, board, move):
@@ -1184,7 +1199,7 @@ if __name__ == "__main__":
     argParser.add_argument(
         "--refute",
         action="store_true",
-        help="With --live: walk the background search's PV to find where cdb ranks the moves differently, and repair both competing lines there from the bottom up, with short searches on the auxiliary threads near the leaves, instead of exploring targets with cdbsearch.",
+        help="With --live: prove the background search's line to cdb for the side to move at the root: repair, from the bottom up with short searches on the auxiliary threads near the leaves, the end of the line and cdb's lines after the opponent's moves that cdb scores better than the engine's, instead of exploring targets with cdbsearch.",
     )
     argParser.add_argument(
         "--pvPlies",
@@ -1212,19 +1227,25 @@ if __name__ == "__main__":
     )
     argParser.add_argument(
         "--repairBudget",
-        help="With --refute: the short searches available for repairing the two lines at a position where cdb and the engine disagree.",
+        help="With --refute: the short searches available for repairing a line.",
         type=int,
         default=60,
     )
     argParser.add_argument(
         "--tol",
-        help="With --refute: the margin in cp of a disagreement between cdb and the engine.",
+        help="With --refute: cdb's score of a position agrees with a short search if they are at most this many cp apart.",
         type=int,
         default=15,
     )
     argParser.add_argument(
+        "--margin",
+        help="With --refute: a move of the opponent is a defence against the engine's line if cdb scores it more than this many cp better for the opponent than the engine's move.",
+        type=int,
+        default=5,
+    )
+    argParser.add_argument(
         "--maxMarks",
-        help="With --refute: repair at most this many of the positions where cdb and the engine disagree, per round.",
+        help="With --refute: repair at most this many defences against the engine's line per round.",
         type=int,
         default=6,
     )
