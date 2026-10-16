@@ -201,6 +201,7 @@ It has four modes:
   Positions that agree, or that could not be brought closer, are skipped until cdb's score of the engine's move there changes, so that every new look at the line (`--repairs`) reaches further up, while its share of the `--repairBudget` searches lasts.
   The engine's values far from the leaves never decide: they miss what only long lines show, and underestimate advantages that only show deep in the endgame.
   Adding positions to cdb does not make its minimax worse, so where a short search is wrong, cdb's own scores of the added positions settle it.
+  After each round, it dives into up to `--dives` of the defences that cdb still prefers to the engine's move after their repair, the ones closest to the root first: it moves the background search to the position after the defence for `--diveNodes` nodes, keeping the TT, proves the engine's line from there in the same way, and then moves the search back to the root for as many nodes. A deep search from a difficult position gives a more reliable line there than the one from the root.
 
 In each round, the targets that are explored (`--maxTargets`) are explored deepest first, and every exploration ends by querying its line from the leaf back to the root.
 As cdb updates the scores of a position when it is queried, this fixes cdb's evals from the bottom up.
@@ -227,8 +228,8 @@ python cdbsfguide_stats.py kq.jsonl --plot kq.png
 ```
 
 ```
-usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--live] [--refute] [--pvPlies PVPLIES] [--leafNodes LEAFNODES] [--proofPlies PROOFPLIES] [--repairs REPAIRS] [--repairBudget REPAIRBUDGET] [--tol TOL] [--margin MARGIN] [--maxMarks MAXMARKS] [--auxThreads AUXTHREADS] [--attach ATTACH] [--prefillNodes PREFILLNODES] [--minDepth MINDEPTH] [--auxNodes AUXNODES] [--scoreGap]
-                     [--threshold THRESHOLD] [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--stats STATS] [--holdout HOLDOUT] [--holdoutPly HOLDOUTPLY] [--seed SEED] [--concurrency CONCURRENCY] [--evalDecay EVALDECAY] [--user USER] [--suppressErrors]
+usage: cdbsfguide.py [-h] [--epd EPD | --san SAN] [--chess960] [--engine ENGINE] [--threads THREADS] [--hash HASH] [--nodes NODES] [--pv] [--maxSearches MAXSEARCHES] [--live] [--refute] [--pvPlies PVPLIES] [--leafNodes LEAFNODES] [--proofPlies PROOFPLIES] [--repairs REPAIRS] [--repairBudget REPAIRBUDGET] [--tol TOL] [--margin MARGIN] [--dives DIVES] [--diveNodes DIVENODES] [--maxMarks MAXMARKS] [--auxThreads AUXTHREADS] [--attach ATTACH] [--prefillNodes PREFILLNODES] [--minDepth MINDEPTH]
+                     [--auxNodes AUXNODES] [--scoreGap] [--threshold THRESHOLD] [--side {both,white,black}] [--maxPly MAXPLY] [--maxNodes MAXNODES] [--targets TARGETS] [--exploreDepth EXPLOREDEPTH] [--maxTargets MAXTARGETS] [--rounds ROUNDS] [--stats STATS] [--holdout HOLDOUT] [--holdoutPly HOLDOUTPLY] [--seed SEED] [--concurrency CONCURRENCY] [--evalDecay EVALDECAY] [--user USER] [--suppressErrors]
 
 Use Stockfish to find the positions where cdb's main lines are likely wrong, and explore those with cdbsearch.
 
@@ -256,6 +257,9 @@ options:
                         With --refute: the short searches available for repairing a line. (default: 60)
   --tol TOL             With --refute: cdb's score of a position agrees with a short search if they are at most this many cp apart. (default: 15)
   --margin MARGIN       With --refute: a move of the opponent is a defence against the engine's line if cdb scores it more than this many cp better for the opponent than the engine's move. (default: 5)
+  --dives DIVES         With --refute: after each round, dive into this many of the defences that cdb still prefers to the engine's move: search from the position after the defence for --diveNodes nodes and prove the engine's line from there, then search from the root again. (default: 1)
+  --diveNodes DIVENODES
+                        With --dives: the nodes of the background search from a dive's position before proving the engine's line from there, and from the root again after it. (default: 2000000000)
   --maxMarks MAXMARKS   With --refute: repair at most this many defences against the engine's line per round. (default: 6)
   --auxThreads AUXTHREADS
                         With --refute: the number of threads of the auxiliary searches. (default: 3)
