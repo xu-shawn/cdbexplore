@@ -325,6 +325,11 @@ class SFGuide:
             board.is_game_over() or chess.popcount(board.occupied) <= cdbsearch.CDB_EGTB
         )
 
+    def enough(self, cv, sv, goal):
+        """whether cdb's score and the engine's of our move, for our side, are both above the goal
+        of the proof by more than --tol: then their exact values do not matter for it"""
+        return goal is not None and min(cv, sv) >= goal + self.args.tol
+
     def agree(self, cv, sv):
         """whether cdb's score of a position agrees with the engine's, both for the side to move:
         within --tol, or both decided for the same side, where the exact score does not matter
@@ -405,17 +410,20 @@ class SFGuide:
         await self.propagate(line[-1])
         return line[-1]
 
-    async def fix(self, p, m, view, budget, indent):
+    async def fix(self, p, m, view, budget, indent, goal=None):
         """Bring cdb's score of our move m at p closer to the engine's score of it, by adding the
         engine's lines to cdb: its own line from p, and where cdb is too pessimistic for us, its
         refutation of cdb's defence against m. Then extend the lines from their ends with further
         short searches, as long as that brings cdb's score closer. Returns whether cdb agrees in the
         end. When adding lines twice in a row does not bring cdb closer, cdb's own evals of the
         positions on the lines differ from the engine's, and more positions would not change that:
-        then p is not tried again until cdb's score of m changes."""
+        then p is not tried again until cdb's score of m changes. Above the goal, the scores do not
+        matter."""
         pv, sv = view
         moves = await self.cdb_now(p)
         cm = moves.get(m.uci())
+        if cm is not None and self.enough(cm, sv, goal):
+            return True
         w = 1 if p.turn == chess.WHITE else -1
         lines = [(p, pv)]
         child = p.copy()
@@ -447,7 +455,7 @@ class SFGuide:
             )
             if cm is None:
                 return False
-            if self.agree(cm, sv):
+            if self.agree(cm, sv) or self.enough(cm, sv, goal):
                 self.agreed[p.epd()] = cm
                 return True
             newGap = cm - sv
@@ -457,7 +465,7 @@ class SFGuide:
                 stalls = 0
             gap = newGap
             if stalls >= 2:
-                if await self.dive(p, m, sv, indent + "  "):
+                if await self.dive(p, m, sv, indent + "  ", goal):
                     return True
                 self.stalled[p.epd()] = cm
                 return False
@@ -473,13 +481,14 @@ class SFGuide:
                 self.stalled[p.epd()] = cm
                 return False
 
-    async def repair(self, start, budget, indent):
+    async def repair(self, start, budget, indent, goal=None):
         """Repair the line from start that proves the engine's line for our side, from the bottom up:
         follow it to the leaf of cdb's tree, compare cdb's scores of our moves on it with the
         engine's from the bottom up, and fix the deepest disagreement; then look at the line again,
         as cdb may now defend differently. Positions that agreed, or that could not be brought
         closer, are skipped until cdb's score of our move changes, so that each look reaches further
-        up the line."""
+        up the line. So are positions where both scores are above the goal of the proof.
+        """
         fixes = 0
         for attempt in range(self.args.repairs):
             line, _ = await self.proof_line(start, budget)
@@ -493,6 +502,8 @@ class SFGuide:
                     self.stalled.get(p.epd()),
                 ):
                     continue
+                if cm is not None and self.enough(cm, view[1], goal):
+                    continue
                 if cm is not None and self.agree(cm, view[1]):
                     self.agreed[p.epd()] = cm
                     continue
@@ -501,12 +512,14 @@ class SFGuide:
             if target is None:
                 break
             fixes += 1
-            await self.fix(*target, budget, indent)
+            await self.fix(*target, budget, indent, goal)
             if budget[0] <= 0:
                 break
         return fixes
 
-    async def refute(self, root, line=None, marks=None, budget=None, indent=""):
+    async def refute(
+        self, root, line=None, marks=None, budget=None, indent="", goal=None
+    ):
         """Prove the engine's line to cdb, for the side to move at the root. Walk the PV of the
         background search as far as its TT entries are deep, and add its positions to cdb. At the
         opponent's positions on it, every move that cdb scores better for the opponent than the
@@ -516,6 +529,10 @@ class SFGuide:
         to be proven good, and a move cdb wrongly prefers to it does not lower cdb's score of it.
         In a dive (see dive()) the engine's line is that of a longer search on the auxiliary threads,
         from the position of the dive, which then plays the part of the root.
+        The goal of the proof is the score for our side that our line should get: the engine's
+        score at the root, or cdb's if higher. Scores above it do not matter, like a bound of
+        alpha-beta: a defence that cdb scores above it concedes enough, and refuting a defence
+        only needs cdb's score of it to reach that of the engine's move, or the goal if lower.
         """
         marks = marks or self.args.maxMarks
         budgetPerLine = budget or self.args.repairBudget
@@ -537,6 +554,11 @@ class SFGuide:
         if not self.final(board):
             await self.cdb_now(board)
         await self.propagate(board)
+        if goal is None:
+            background = self.live.background().get("score")
+            ours = (await self.cdb_now(root)).get(pv[0].uci()) if pv else None
+            known = [v for v in (background, ours) if v is not None]
+            goal = max(known) if known else None
 
         found = []  # the defences: position, the engine's move, the defence, its gap
         for b, m in line:
@@ -552,14 +574,18 @@ class SFGuide:
                 # where both are decided for the same side, the gap does not matter
                 if min(score, ours) >= DECIDED or max(score, ours) <= -DECIDED:
                     continue
+                if goal is not None and -score >= goal + self.args.tol:
+                    continue  # the defence concedes enough
                 found.append((b, m, chess.Move.from_uci(a), score - ours))
         what = "the dive's line" if dive else "the engine's line"
         depths = (
             "" if dive else f" with TT entries of depth {self.args.minDepth} or more"
         )
+        wr = 1 if root.turn == chess.WHITE else -1
         print(
             f"{indent}  {what}, {len(line)} plies{depths}: {root.variation_san(pv[: min(len(line), 16)])} ...;"
-            f" cdb sees {len(found)} better defences against it",
+            f" cdb sees {len(found)} better defences against it"
+            + (f", with the goal {wr * goal:+}" if goal is not None else ""),
             flush=True,
         )
         if not dive:
@@ -567,7 +593,7 @@ class SFGuide:
 
         # the end of the engine's line
         budget = [budgetPerLine]
-        fixes = await self.repair(board, budget, indent + "    ")
+        fixes = await self.repair(board, budget, indent + "    ", goal)
         print(
             f"{indent}  the end of the line: {fixes} fixes, {budgetPerLine - budget[0]} engine searches",
             flush=True,
@@ -597,7 +623,10 @@ class SFGuide:
             self.repaired[key((b, m, a))] = self.repaired.get(key((b, m, a)), 0) + 1
             child, budget = b.copy(), [budgetPerLine]
             child.push(a)
-            fixes = await self.repair(child, budget, indent + "    ")
+            # cdb's score of the engine's move, for our side, or the goal if lower
+            need = -before[m.uci()] if m.uci() in before else goal
+            need = min(need, goal) if goal is not None else need
+            fixes = await self.repair(child, budget, indent + "    ", need)
             await self.propagate(b)
             after = await self.cdb_now(b)
             print(
@@ -624,7 +653,7 @@ class SFGuide:
                 searches=budgetPerLine - budget[0],
             )
 
-    async def dive(self, p, m, sv, indent):
+    async def dive(self, p, m, sv, indent, goal=None):
         """At a position where adding the engine's lines does not bring cdb's score of our move m
         closer to the engine's, go down that line for a while: search the position longer on the
         auxiliary threads (--diveNodes), and prove the engine's line from there as from the root,
@@ -641,13 +670,11 @@ class SFGuide:
             pv, score = await self.live.aux_line(p, self.args.diveNodes)
             if not pv or score is None:
                 return False
-            self.searched[p.epd()] = (
-                pv,
-                score,
-            )  # the proof lines through p now take this move
+            # the proof lines through p now take this move
+            self.searched[p.epd()] = pv, score
             before = (await self.cdb_now(p)).get(pv[0].uci())
             await self.refute(
-                p, pv, self.args.diveMarks, self.args.repairBudget // 2, indent
+                p, pv, self.args.diveMarks, self.args.repairBudget // 2, indent, goal
             )
             await self.propagate(p)
             after = (await self.cdb_now(p)).get(pv[0].uci())
@@ -664,7 +691,9 @@ class SFGuide:
                 before=before,
                 after=after,
             )
-            return after is not None and self.agree(after, score)
+            return after is not None and (
+                self.agree(after, score) or self.enough(after, score, goal)
+            )
         finally:
             self.diving = False
 
