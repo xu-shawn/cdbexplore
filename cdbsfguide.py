@@ -547,8 +547,12 @@ class SFGuide:
             if ours is None:
                 continue
             for a, score in moves.items():
-                if a != b.uci(m) and score > ours + self.args.margin:
-                    found.append((b, m, chess.Move.from_uci(a), score - ours))
+                if a == b.uci(m) or score <= ours + self.args.margin:
+                    continue
+                # where both are decided for the same side, the gap does not matter
+                if min(score, ours) >= DECIDED or max(score, ours) <= -DECIDED:
+                    continue
+                found.append((b, m, chess.Move.from_uci(a), score - ours))
         what = "the dive's line" if dive else "the engine's line"
         depths = (
             "" if dive else f" with TT entries of depth {self.args.minDepth} or more"
