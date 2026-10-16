@@ -1505,9 +1505,9 @@ if __name__ == "__main__":
     )
     argParser.add_argument(
         "--margin",
-        help="With --refute: a move of the opponent is a defence against the engine's line if cdb scores it more than this many cp better for the opponent than the engine's move.",
+        help="With --refute: a move of the opponent is a defence against the engine's line if cdb scores it more than this many cp better for the opponent than the engine's move. Even 1 cp caps cdb's score of the line.",
         type=int,
-        default=5,
+        default=0,
     )
     argParser.add_argument(
         "--dives",

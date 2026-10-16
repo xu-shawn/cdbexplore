@@ -191,7 +191,7 @@ It has four modes:
   This needs the `ttprobe`, `ttmoves` and `aux*` commands of the [`cdb-tt`](https://github.com/xu-shawn/Stockfish/tree/cdb-tt) branch of Stockfish.
 * With `--live --refute`, it fixes cdb's evals from the bottom up itself, with short searches near the leaves, instead of letting `cdbsearch` explore.
   It proves the line of the background search to cdb, for the side to move at the root: it walks the PV of the background search (`--pvPlies`), as far as its TT entries have a depth of at least `--minDepth`, and adds its positions to cdb.
-  At the opponent's positions on the line, every move that cdb scores more than `--margin` cp better for the opponent than the engine's move is a defence against the line, which caps cdb's score of it.
+  At the opponent's positions on the line, every move that cdb scores more than `--margin` cp (by default 0) better for the opponent than the engine's move is a defence against the line, which caps cdb's score of it: even 1 cp does.
   Each round, it repairs the end of the line, and cdb's lines after up to `--maxMarks` defences: those repaired the fewest times so far, the ones closest to the root first, as the shallowest defence on cdb's path caps its score of the line, and among those the largest gaps.
   Where cdb scores another move of the side to move at the root above the engine's, nothing needs doing: the line only has to be proven good, and a move cdb wrongly prefers to it does not lower cdb's score of it.
   The proof has a goal, the score that the line should get: the engine's score at the root, or cdb's if higher. Like a bound of alpha-beta, scores above it do not matter: a defence that cdb scores above it concedes enough, refuting a defence only needs cdb's score of it to reach that of the engine's move (or the goal, if lower), and positions where both cdb's score and the engine's are above that by more than `--tol` cp are left alone.
@@ -258,7 +258,7 @@ options:
   --repairBudget REPAIRBUDGET
                         With --refute: the short searches available for repairing a line. (default: 60)
   --tol TOL             With --refute: cdb's score of a position agrees with a short search if they are at most this many cp apart. (default: 15)
-  --margin MARGIN       With --refute: a move of the opponent is a defence against the engine's line if cdb scores it more than this many cp better for the opponent than the engine's move. (default: 5)
+  --margin MARGIN       With --refute: a move of the opponent is a defence against the engine's line if cdb scores it more than this many cp better for the opponent than the engine's move. Even 1 cp caps cdb's score of the line. (default: 0)
   --dives DIVES         With --refute: per round, at most this many positions where adding the engine's lines does not bring cdb closer get a dive: a longer search there on the auxiliary threads, and a proof of its line from there as from the root. (default: 2)
   --diveNodes DIVENODES
                         With --dives: the nodes of the longer search of a dive. (default: 500000000)
