@@ -332,16 +332,15 @@ class SFGuide:
         """The line from start that proves the engine's line for our side, the side to move at the
         root: our side plays the engine's moves, and the opponent cdb's best defences, along cdb's
         PV, to the leaf of cdb's tree. Positions that cdb reaches only by another move of ours are
-        not on it: we would not play into them. Returns the positions with their moves, and at our
-        side's positions the engine's line and score, or None where the move is that of the
-        background search's TT, deep enough to trust; and the last position."""
+        not on it: we would not play into them. Our moves come from short searches, not from the TT
+        of the background search, whose entries may be shallow or stale. Returns the positions with
+        their moves, and at our side's positions the engine's line and score; and the last position.
+        """
         if self.measureDB is None:
             self.measureDB = self.chessdb(start)
         line, b, seen = [], start.copy(), set()
-        cdb, i = (
-            None,
-            0,
-        )  # cdb's PV from some position on the line, and where we are on it
+        # cdb's PV from some position on the line, and where we are on it
+        cdb, i = None, 0
         while (
             len(line) < self.args.proofPlies
             and not self.final(b)
@@ -354,18 +353,10 @@ class SFGuide:
                     0,
                 )
             if b.turn == self.root.turn:
-                node = await self.live.probe(b)
-                if (
-                    node.get("hit") == "1"
-                    and int(node["depth"]) >= self.args.minDepth
-                    and node.get("move", "none") != "none"
-                ):
-                    m, view = chess.Move.from_uci(node["move"]), None
-                else:
-                    view = await self.engine_view(b, budget)
-                    if not view or not view[0]:
-                        break
-                    m = view[0][0]
+                view = await self.engine_view(b, budget)
+                if not view or not view[0]:
+                    break
+                m = view[0][0]
                 if i < len(cdb) and cdb[i] == m:
                     i += 1
                 else:  # cdb plays another move: ask for its PV after ours
@@ -457,7 +448,8 @@ class SFGuide:
                 more = await self.engine_view(e, budget)
                 if more and more[0]:
                     lines.append((e, more[0]))
-            if not lines:
+            if not lines:  # the lines end in mate or a tablebase position
+                self.stalled[p.epd()] = cm
                 return False
 
     async def repair(self, start, budget, indent):
@@ -473,7 +465,7 @@ class SFGuide:
             target = None
             for p, m, view in reversed(line):
                 if view is None or view[1] is None:
-                    continue  # the opponent's move, or the background search's
+                    continue  # the opponent's move
                 cm = (await self.cdb_now(p)).get(m.uci())
                 if cm is not None and cm in (
                     self.agreed.get(p.epd()),
